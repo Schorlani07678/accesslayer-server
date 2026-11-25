@@ -7,7 +7,17 @@ import {
    httpUpdateProtocolFee,
    httpGetAuditLog,
 } from './admin.controllers';
+import {
+   httpListReferralHolds,
+   httpResolveReferralHold,
+} from './referral-holds.controllers';
+import { getFlaggedSessions } from './session-security.service';
+import { safeIntParam } from '../../utils/query.utils';
 import { httpSyncKeyState } from './key-sync.controllers';
+import {
+   allowlistCsvUpload,
+   httpImportKeyAllowlist,
+} from './key-allowlist.controller';
 import {
    httpCreateMultisigProposal,
    httpGetMultisigProposalQueue,
@@ -47,6 +57,19 @@ import { ErrorCode } from '../../constants/error.constants';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../../utils/prisma.utils';
 import { logger } from '../../utils/logger.utils';
+import { invalidateKeyVestingCache } from '../vesting/vesting.service';
+import { treasuryRouter } from '../treasury/treasury.routes';
+import { adminFlagRouter } from '../flags/feature-flags.routes';
+import {
+   httpDeleteDlqEntry,
+   httpListDlq,
+   httpReplayDlqBatch,
+   httpReplayDlqEntry,
+} from './dlq.controllers';
+import {
+   httpEndImpersonation,
+   httpStartImpersonation,
+} from './impersonation.controllers';
 
 function isValidStellarAddress(address: string): boolean {
    return typeof address === 'string' && /^G[A-Z2-7]{55}$/.test(address);
@@ -119,13 +142,91 @@ function serializeTimelockAction(action: any) {
 
 const adminRouter = Router();
 
+adminRouter.use(adminFlagRouter);
+
 adminRouter.patch('/creators/:id/metadata', httpUpdateCreatorMetadata);
 adminRouter.post('/indexer/replay', adminGuard, httpReplayIndexerEvents);
+adminRouter.post(
+   '/keys/:keyId/allowlist/import',
+   adminGuard,
+   allowlistCsvUpload,
+   httpImportKeyAllowlist
+);
 adminRouter.post('/keys/:keyId/pause', adminGuard, httpSetKeyTradingPaused);
 adminRouter.post('/keys/:keyId/resume', adminGuard, httpSetKeyTradingPaused);
 adminRouter.post('/keys/:keyId/sync', adminGuard, httpSyncKeyState);
 adminRouter.patch('/protocol-fee', adminGuard, httpUpdateProtocolFee);
 adminRouter.get('/audit-log', adminGuard, httpGetAuditLog);
+
+// ── Indexer dead-letter queue (#1341) ─────────────────────────
+// GET lists live failed jobs. POST .../replay re-runs a job once through its
+// registered handler. DELETE removes an entry and requires a reason.
+adminRouter.get('/dlq', adminGuard, httpListDlq);
+adminRouter.post('/dlq/replay', adminGuard, httpReplayDlqBatch);
+adminRouter.post('/dlq/:id/replay', adminGuard, httpReplayDlqEntry);
+adminRouter.delete('/dlq/:id', adminGuard, httpDeleteDlqEntry);
+
+// ── Read-only impersonation (#1342) ───────────────────────────
+// POST starts a 15-minute read-only session for a wallet's user and needs a
+// fresh second factor (mfa_at claim). DELETE ends a session immediately.
+adminRouter.post('/impersonate', adminGuard, httpStartImpersonation);
+adminRouter.delete('/impersonate', adminGuard, httpEndImpersonation);
+
+// ── Referral abuse review (#1241) ─────────────────────────────
+// GET /admin/referral-holds?status=&limit=&cursor= lists withheld referral
+// rewards. PATCH /admin/referral-holds/:id with { status: 'RELEASED' |
+// 'REJECTED' } resolves a PENDING hold; releasing pays the reward once.
+adminRouter.get('/referral-holds', adminGuard, httpListReferralHolds);
+adminRouter.patch('/referral-holds/:id', adminGuard, httpResolveReferralHold);
+
+// ── Security monitoring (#1035) ───────────────────────────────
+
+const securityFlagsQuerySchema = z.object({
+   limit: safeIntParam({
+      defaultValue: 50,
+      min: 1,
+      max: 100,
+      label: 'Limit',
+   }),
+   offset: safeIntParam({
+      defaultValue: 0,
+      min: 0,
+      max: Number.MAX_SAFE_INTEGER,
+      label: 'Offset',
+   }),
+   wallet: z.string().trim().min(1).optional(),
+   reason: z.enum(['NEW_IP_FOR_WALLET', 'HIGH_REQUEST_RATE', 'UNUSUAL_HOUR_ACCESS']).optional(),
+});
+
+/**
+ * GET /api/v1/admin/security/flags?limit=&offset=&wallet=&reason=
+ *
+ * Paginated list of sessions flagged by anomaly detection (new IP for
+ * wallet, high request rate, unusual hour access), newest first. Requires
+ * admin JWT (#1035).
+ */
+adminRouter.get(
+   '/security/flags',
+   adminGuard,
+   async (req: AdminRequest, res, next) => {
+      const parsed = securityFlagsQuerySchema.safeParse(req.query);
+      if (!parsed.success) {
+         sendValidationError(
+            res,
+            'Invalid security flags query',
+            zodIssuesToDetails(parsed.error.issues)
+         );
+         return;
+      }
+
+      try {
+         sendSuccess(res, await getFlaggedSessions(parsed.data));
+      } catch (error) {
+         logger.error({ error }, 'Security flags lookup failed');
+         next(error);
+      }
+   }
+);
 
 /**
  * GET /api/v1/admin/proposals
@@ -304,6 +405,7 @@ adminRouter.post('/vesting', adminGuard, async (req: AdminRequest, res, next) =>
             claimedKeys: new Prisma.Decimal(0),
          },
       });
+      await invalidateKeyVestingCache(String(keyId), String(beneficiary));
 
       sendSuccess(res, {
          ...schedule,
@@ -1166,5 +1268,8 @@ adminRouter.post(
       }
    }
 );
+
+// Platform treasury dashboard reads (#1181). Every treasury route is admin-only.
+adminRouter.use('/treasury', adminGuard, treasuryRouter);
 
 export default adminRouter;

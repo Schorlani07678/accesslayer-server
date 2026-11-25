@@ -12,6 +12,12 @@ import {
    processIndexerChainEvents,
    IndexerChainEvent,
 } from '../../utils/indexer-event-processor.utils';
+import {
+   KeyLpDb,
+   recordKeyLpDeposit,
+   recordKeyLpWithdrawal,
+} from '../lp-rewards/lp-rewards.service';
+import { parseScaled } from '../lp-rewards/lp-reward-math';
 
 export interface LpChainEvent extends IndexerChainEvent {
    eventType: 'LP_ADDED' | 'LP_CLAIMED' | 'LP_REMOVED';
@@ -21,6 +27,73 @@ export interface LpChainEvent extends IndexerChainEvent {
    sharePercent?: string;
    /** Reward amount claimed, only meaningful for LP_CLAIMED. */
    rewardAmount?: string;
+   /** Liquidity amount, only meaningful for LP_ADDED. */
+   amount?: string;
+   /**
+    * LP tokens minted, only meaningful for LP_ADDED. Mirrored into
+    * key_lp_positions for reward accrual (#1196); falls back to `amount`.
+    */
+   lpTokens?: string;
+   /** Price the liquidity entered at, only meaningful for LP_ADDED. */
+   entryPrice?: string;
+}
+
+/**
+ * Mirrors an LP deposit into key_lp_positions inside the indexer's
+ * transaction. Events without a usable token amount are skipped (logged),
+ * so the legacy LpPosition write is never blocked by this.
+ */
+async function mirrorKeyLpDeposit(
+   tx: KeyLpDb,
+   event: LpChainEvent
+): Promise<void> {
+   const lpTokens = event.lpTokens ?? event.amount;
+   if (lpTokens === undefined) return;
+   let tokens: bigint;
+   try {
+      tokens = parseScaled(lpTokens);
+      if (event.entryPrice !== undefined) parseScaled(event.entryPrice);
+   } catch {
+      logger.warn(
+         buildLogFields({
+            type: 'key_lp_position_invalid_amount',
+            eventId: `${event.txHash}:${event.eventIndex}`,
+         }),
+         'Skipping key_lp_positions mirror for LP event with an invalid amount'
+      );
+      return;
+   }
+   if (tokens === 0n) return;
+   await recordKeyLpDeposit(tx, {
+      keyId: event.keyId,
+      wallet: event.wallet,
+      lpTokens,
+      price: event.entryPrice,
+   });
+}
+
+function normalizeEventType(
+   eventType: string
+): 'LP_ADDED' | 'LP_CLAIMED' | 'LP_REMOVED' | string {
+   switch (eventType) {
+      case 'LiquidityAdded':
+         return 'LP_ADDED';
+      case 'RewardsClaimed':
+         return 'LP_CLAIMED';
+      case 'LiquidityRemoved':
+         return 'LP_REMOVED';
+      default:
+         return eventType;
+   }
+}
+
+export function isLpEventType(eventType: string): boolean {
+   const normalized = normalizeEventType(eventType);
+   return (
+      normalized === 'LP_ADDED' ||
+      normalized === 'LP_CLAIMED' ||
+      normalized === 'LP_REMOVED'
+   );
 }
 
 function isValidEvent(event: IndexerChainEvent): event is LpChainEvent {
@@ -39,11 +112,20 @@ function isValidEvent(event: IndexerChainEvent): event is LpChainEvent {
 
    if (event.eventType === 'LP_ADDED') {
       const share = Number(e.sharePercent);
-      return (
+      const isShareValid =
          typeof e.sharePercent === 'string' &&
          Number.isFinite(share) &&
-         share >= 0
-      );
+         share >= 0;
+      if (!isShareValid) {
+         return false;
+      }
+
+      if (e.amount !== undefined) {
+         const amt = Number(e.amount);
+         return typeof e.amount === 'string' && Number.isFinite(amt) && amt >= 0;
+      }
+
+      return true;
    }
 
    if (event.eventType === 'LP_CLAIMED') {
@@ -68,7 +150,13 @@ function isValidEvent(event: IndexerChainEvent): event is LpChainEvent {
 export async function processLpEvents(
    events: IndexerChainEvent[]
 ): Promise<void> {
-   await processIndexerChainEvents(events, async event => {
+   await processIndexerChainEvents(events, async rawEvent => {
+      const normalizedEventType = normalizeEventType(rawEvent.eventType);
+      const event: IndexerChainEvent = {
+         ...rawEvent,
+         eventType: normalizedEventType,
+      };
+
       if (
          event.eventType !== 'LP_ADDED' &&
          event.eventType !== 'LP_CLAIMED' &&
@@ -102,20 +190,37 @@ export async function processLpEvents(
 
             if (event.eventType === 'LP_ADDED') {
                const sharePercent = event.sharePercent as string;
+               const eventAmount = event.amount ?? '0';
                const existing = await tx.lpPosition.findFirst({
                   where: { wallet, keyId },
                });
 
                if (existing) {
+                  const newAmount =
+                     existing.status === 'removed'
+                        ? eventAmount
+                        : { increment: eventAmount };
+
                   await tx.lpPosition.update({
                      where: { id: existing.id },
-                     data: { sharePercent, status: 'active' },
+                     data: {
+                        sharePercent,
+                        amount: newAmount,
+                        status: 'active',
+                     },
                   });
                } else {
                   await tx.lpPosition.create({
-                     data: { wallet, keyId, sharePercent, status: 'active' },
+                     data: {
+                        wallet,
+                        keyId,
+                        sharePercent,
+                        amount: eventAmount,
+                        status: 'active',
+                     },
                   });
                }
+               await mirrorKeyLpDeposit(tx, event);
                return;
             }
 
@@ -147,7 +252,8 @@ export async function processLpEvents(
                return;
             }
 
-            // LP_REMOVED
+            // LP_REMOVED — full removal, matching the legacy LpPosition model.
+            await recordKeyLpWithdrawal(tx, { keyId, wallet });
             const existing = await tx.lpPosition.findFirst({
                where: { wallet, keyId },
             });
@@ -165,7 +271,7 @@ export async function processLpEvents(
             }
             await tx.lpPosition.update({
                where: { id: existing.id },
-               data: { status: 'removed' },
+               data: { status: 'removed', amount: 0 },
             });
          });
       } catch (error) {

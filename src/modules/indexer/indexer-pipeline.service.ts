@@ -16,9 +16,69 @@ import { dedupeChainEvents } from '../../utils/indexer-dedupe.utils';
 import { logSellTransactionConfirmed } from '../../utils/sell-transaction-logger.utils';
 import { persistCirculatingSupply } from './persist-circulating-supply.service';
 import { invalidateVolumeLeaderboardCache } from '../creators/creator-leaderboard-volume.service';
-import { recordFirstTradeReferralReward } from '../referrals/referrals.service';
+import { recordTradeReferralReward } from '../referrals/referrals.service';
 import { invalidateCreatorPortfolioStatsCache } from '../creators/creator-portfolio.service';
 import { invalidateActivityFeedCache } from '../activity/activity-feed.service';
+import {
+   processSocialMetadataEvents,
+   SOCIAL_METADATA_UPDATED_EVENT_TYPE,
+} from './social-metadata-indexer.service';
+import {
+   canonicalInvoiceEventType,
+   INVOICE_PROTOCOL_EVENT_TYPES,
+} from './invoice-protocol.events';
+
+function isTradeEvent(event: IndexerChainEvent): boolean {
+   return event.eventType === 'KEY_BOUGHT' || event.eventType === 'KEY_SOLD';
+}
+
+function isGovernanceProposalEvent(event: IndexerChainEvent): boolean {
+   return (
+      event.eventType === 'PROPOSAL_CREATED' ||
+      event.eventType === 'ProposalCreated' ||
+      event.eventType === 'VOTE_CAST' ||
+      event.eventType === 'VoteCast' ||
+      event.eventType === 'PROPOSAL_EXECUTED' ||
+      event.eventType === 'ProposalExecuted'
+   );
+}
+
+function isKeyPollEvent(event: IndexerChainEvent): boolean {
+   return [
+      'PollCreated',
+      'POLL_CREATED',
+      'PollVoteCast',
+      'POLL_VOTE_CAST',
+      'PollClosed',
+      'POLL_CLOSED',
+   ].includes(event.eventType);
+}
+
+export interface TradeEventProcessingOptions {
+   /**
+    * Advance the shared ledger cursor after processing the batch.
+    * Defaults to true so direct callers keep the original behavior; the
+    * pipeline dispatcher (`processIndexerEvents`) sets it to false and
+    * advances the cursor once over the whole mixed batch instead.
+    */
+   advanceCursor?: boolean;
+}
+import {
+   processVolumeDiscountTierEvents,
+   VOLUME_DISCOUNT_EVENT_TYPES,
+} from './volume-discount-tier-indexer.service';
+import { invalidateTraderDiscountCache } from '../traders/trader-discount.service';
+import { broadcastSwapPrice } from '../price-stream/price-stream.gateway';
+import { processSubscriptionCreatedEvent } from '../keys/subscription-status.service';
+import {
+   SWAP_EVENT_TYPES,
+   processAtomicSwapEvent,
+   markExpiredSwaps,
+} from './atomic-swap-indexer.service';
+import {
+   processGateConfigEvents,
+   GATE_CONFIG_UPDATED_EVENT_TYPES,
+} from './key-gate-config-indexer.service';
 
 /**
  * Processes a batch of on-chain trade events (KEY_BOUGHT or KEY_SOLD).
@@ -34,13 +94,41 @@ import { invalidateActivityFeedCache } from '../activity/activity-feed.service';
  * - Writes a checkpoint record of the highest ledger processed.
  */
 export async function processTradeEvents(
-   events: IndexerChainEvent[]
+   events: IndexerChainEvent[],
+   options: TradeEventProcessingOptions = {}
 ): Promise<void> {
+   const { advanceCursor = true } = options;
+
    await processIndexerChainEvents(events, async event => {
       if (event.eventType === 'CREATOR_REGISTERED') {
          if (typeof event.actor === 'string' && event.actor.length > 0) {
             await invalidateCreatorPortfolioStatsCache(event.actor);
          }
+         return;
+      }
+
+      if (
+         event.eventType === 'BundleExecuted' ||
+         event.eventType === 'BUNDLE_EXECUTED'
+      ) {
+         const { processBundleTradeEvent } =
+            await import('./bundle-trade-indexer.service');
+         await processBundleTradeEvent(event as any, prisma);
+         return;
+      }
+
+      if (VOLUME_DISCOUNT_EVENT_TYPES.has(event.eventType)) {
+         await processVolumeDiscountTierEvents([event]);
+         return;
+      }
+
+      if (SWAP_EVENT_TYPES.has(event.eventType)) {
+         await processAtomicSwapEvent(event as any, prisma);
+         return;
+      }
+
+      if (GATE_CONFIG_UPDATED_EVENT_TYPES.includes(event.eventType)) {
+         await processGateConfigEvents([event]);
          return;
       }
 
@@ -76,7 +164,8 @@ export async function processTradeEvents(
          }
       }
 
-      const { creatorId, actor, amount, price, feePaid, tradeAt, ledger } = event;
+      const { creatorId, actor, amount, price, feePaid, tradeAt, ledger } =
+         event;
       const tradeQty = Number(amount);
       let pricePerKeyXlm = 0;
       try {
@@ -89,15 +178,16 @@ export async function processTradeEvents(
       }
       // payment_asset is optional — absent events default to 'XLM' (#934).
       const paymentAsset: string =
-         typeof event.paymentAsset === 'string' && event.paymentAsset.trim() !== ''
+         typeof event.paymentAsset === 'string' &&
+         event.paymentAsset.trim() !== ''
             ? event.paymentAsset.trim().toUpperCase()
             : 'XLM';
 
       // Run referral bookkeeping before the non-transactional trade writes so
       // a failure can abort this event and let the indexer retry it.
-      // The conditional claim makes a successful referral write replay-safe.
+      // Rewards are now paid on EVERY trade by a referred wallet.
       try {
-         await recordFirstTradeReferralReward({
+         await recordTradeReferralReward({
             refereeAddress: actor,
             keyId: creatorId,
             tradeValueXlm: pricePerKeyXlm * tradeQty,
@@ -111,7 +201,7 @@ export async function processTradeEvents(
                eventId: `${event.txHash}:${event.eventIndex}`,
                error,
             },
-            'Failed to record referral first trade reward'
+            'Failed to record referral trade reward'
          );
          throw error;
       }
@@ -140,6 +230,9 @@ export async function processTradeEvents(
       // this new KEY_BOUGHT ("investment") activity shows up promptly.
       await invalidateActivityFeedCache();
 
+      // Invalidate trader's 30d volume discount cache so subsequent lookups reflect the new trade (#1030).
+      await invalidateTraderDiscountCache(actor);
+
       // 2. Ownership read model (#897):
       // - buys go through recordKeyPurchase so the weighted-average cost
       //   basis is updated on every buy (reset when rebuilding from zero).
@@ -150,28 +243,69 @@ export async function processTradeEvents(
       // Event `price` is the unit (per-key) bonding-curve price in stroops,
       // consistent with upsertPriceSnapshot below.
       if (event.eventType === 'KEY_BOUGHT') {
-         await recordKeyPurchase(
+         const updatedOwnership = await recordKeyPurchase(
             actor,
             creatorId,
             tradeQty,
             pricePerKeyXlm,
             new Date(tradeAt)
          );
+         const { recordBalanceCheckpoint } = await import(
+            './balance-checkpoint-indexer.service'
+         );
+         await recordBalanceCheckpoint({
+            holder: actor,
+            keyId: creatorId,
+            ledger: Number(ledger),
+            balance: Number(updatedOwnership.balance),
+            timestamp: new Date(tradeAt),
+         });
       } else {
+         let updatedOwnership: { balance: unknown };
          try {
-            await recordKeySale(actor, creatorId, tradeQty, pricePerKeyXlm);
+            updatedOwnership = await recordKeySale(
+               actor,
+               creatorId,
+               tradeQty,
+               pricePerKeyXlm,
+               new Date(tradeAt)
+            );
          } catch {
             const balanceChange = -tradeQty;
-            await updateOwnership(actor, creatorId, balanceChange, {
-               event_type: 'sell',
-               ledger_sequence: Number(ledger),
-            });
+            updatedOwnership = await updateOwnership(
+               actor,
+               creatorId,
+               balanceChange,
+               {
+                  event_type: 'sell',
+                  ledger_sequence: Number(ledger),
+                  occurredAt: new Date(tradeAt),
+               }
+            );
          }
+         const { recordBalanceCheckpoint } = await import(
+            './balance-checkpoint-indexer.service'
+         );
+         await recordBalanceCheckpoint({
+            holder: actor,
+            keyId: creatorId,
+            ledger: Number(ledger),
+            balance: Number(updatedOwnership.balance),
+            timestamp: new Date(tradeAt),
+         });
       }
 
       // 3. Recompute circulating supply first so the price snapshot/history
       // row records the supply *after* this trade (#893).
       const supplyAfterTrade = await persistCirculatingSupply(creatorId);
+
+      // Holder balances just changed, so drop the cached content-gate
+      // access checks for this key rather than waiting out the 30s TTL
+      // (#1137).
+      const { invalidateContentAccessCache } = await import(
+         '../content-access/content-access.service'
+      );
+      await invalidateContentAccessCache(creatorId);
 
       // 4. upsertPriceSnapshot — records the price snapshot atomically with
       // the post-trade supply and trade direction, for TWAP and historical
@@ -183,6 +317,14 @@ export async function processTradeEvents(
          ledger: Number(ledger),
          supply: BigInt(supplyAfterTrade),
          direction: event.eventType === 'KEY_BOUGHT' ? 'BUY' : 'SELL',
+      });
+
+      broadcastSwapPrice({
+         key_id: creatorId,
+         price: pricePerKeyXlm.toString(),
+         amount: String(amount),
+         direction: event.eventType === 'KEY_BOUGHT' ? 'buy' : 'sell',
+         timestamp: new Date(tradeAt).toISOString(),
       });
 
       // 5. Emit a structured log for confirmed sells, mirroring buy-side logging.
@@ -214,6 +356,25 @@ export async function processTradeEvents(
       }
    });
 
+   if (!advanceCursor) {
+      return;
+   }
+
+   await advanceIndexerCursorForBatch(events);
+}
+
+/**
+ * Advances the shared ledger cursor to the highest ledger in the batch.
+ *
+ * The cursor is a single global checkpoint (`IndexedLedger`, id=1) that the
+ * worker uses to resume polling, so it must only move forward over events
+ * that have already been fully processed.
+ */
+export async function advanceIndexerCursorForBatch(
+   events: IndexerChainEvent[]
+): Promise<void> {
+   await markExpiredSwaps(prisma, new Date());
+
    const uniqueEvents = dedupeChainEvents(events);
 
    const processedLedgers = uniqueEvents
@@ -226,6 +387,673 @@ export async function processTradeEvents(
       const cursor = `${maxLedger}-000`;
       await updateIndexedLedger(maxLedger, cursor, batchHash);
    }
+}
+
+/**
+ * Processes a mixed batch of indexer events (trades, social metadata and
+ * TWAPUpdated observations, and invoice protocol projections).
+ *
+ * Routes each event type to its handler and advances the ledger cursor
+ * exactly once, over the full batch, so batches containing only social
+ * metadata events still make cursor progress.
+ */
+export async function processIndexerEvents(
+   events: IndexerChainEvent[],
+   options: { advanceCursor?: boolean } = {}
+): Promise<void> {
+   const feeEvents = events.filter(event => ['fee_schedule_set', 'FEE_SCHEDULE_SET'].includes(event.eventType));
+   if (feeEvents.length > 0) {
+      const { upsertFeeSchedule } = await import('../keys/fee-schedule.service');
+      for (const event of feeEvents) {
+         const data = event as any;
+         if (typeof data.keyId !== 'string' || !Number.isInteger(Number(data.startBps)) || !Number.isInteger(Number(data.floorBps)) || !Number.isInteger(Number(data.decayLedgers)) || !Number.isInteger(Number(data.ledger))) continue;
+         await upsertFeeSchedule({ keyId: data.keyId, startBps: Number(data.startBps), floorBps: Number(data.floorBps), decayLedgers: Number(data.decayLedgers), startLedger: Number(data.ledger) });
+      }
+   }
+   // #1349: launch cap config and buy events keep per-wallet cap status fresh.
+   const launchCapConfigEvents = events.filter(event =>
+      ['launch_cap_set', 'LAUNCH_CAP_SET'].includes(event.eventType),
+   );
+   if (launchCapConfigEvents.length > 0) {
+      const { upsertLaunchCapConfig } = await import('../keys/launch-cap.service');
+      for (const event of launchCapConfigEvents) {
+         const data = event as any;
+         if (typeof data.keyId !== 'string') continue;
+         if (!Number.isInteger(Number(data.startLedger)) || !Number.isInteger(Number(data.endLedger))) continue;
+         try {
+            await upsertLaunchCapConfig({
+               keyId: data.keyId,
+               startLedger: Number(data.startLedger),
+               endLedger: Number(data.endLedger),
+               startCap: BigInt(data.startCap ?? 0),
+               endCap: BigInt(data.endCap ?? 0),
+               exemptWallets: Array.isArray(data.exemptWallets) ? data.exemptWallets.map(String) : [],
+            });
+         } catch { /* malformed event ignored */ }
+      }
+   }
+   const launchBuyEvents = events.filter(event =>
+      ['launch_buy', 'LAUNCH_BUY'].includes(event.eventType),
+   );
+   if (launchBuyEvents.length > 0) {
+      const { recordLaunchPurchase } = await import('../keys/launch-cap.service');
+      for (const event of launchBuyEvents) {
+         const data = event as any;
+         if (typeof data.id !== 'string' || typeof data.keyId !== 'string' || typeof data.wallet !== 'string') continue;
+         if (!Number.isInteger(Number(data.ledger))) continue;
+         try {
+            await recordLaunchPurchase({
+               id: data.id,
+               keyId: data.keyId,
+               wallet: data.wallet,
+               amount: BigInt(data.amount ?? 0),
+               ledger: Number(data.ledger),
+            });
+         } catch { /* malformed event ignored */ }
+      }
+   }
+   // #1350: social recovery guardians and recovery lifecycle.
+   const guardianSetEvents = events.filter(event =>
+      ['guardians_set', 'GUARDIANS_SET'].includes(event.eventType),
+   );
+   if (guardianSetEvents.length > 0) {
+      const { handleGuardiansSet } = await import('../wallets/social-recovery.service');
+      for (const event of guardianSetEvents) {
+         const data = event as any;
+         if (typeof data.walletAddress !== 'string' || !Array.isArray(data.guardians)) continue;
+         if (!Number.isInteger(Number(data.threshold))) continue;
+         await handleGuardiansSet({
+            walletAddress: data.walletAddress,
+            guardians: data.guardians.map(String),
+            threshold: Number(data.threshold),
+            delayLedgers: Number.isFinite(Number(data.delayLedgers)) ? Number(data.delayLedgers) : 0,
+         });
+      }
+   }
+   const recoveryInitiatedEvents = events.filter(event =>
+      ['recovery_initiated', 'RECOVERY_INITIATED'].includes(event.eventType),
+   );
+   if (recoveryInitiatedEvents.length > 0) {
+      const { handleRecoveryInitiated } = await import('../wallets/social-recovery.service');
+      for (const event of recoveryInitiatedEvents) {
+         const data = event as any;
+         if (typeof data.requestId !== 'string' || typeof data.walletAddress !== 'string') continue;
+         if (typeof data.initiator !== 'string' || typeof data.newOwner !== 'string') continue;
+         if (!Number.isInteger(Number(data.initiatedLedger)) || !Number.isInteger(Number(data.earliestExecute))) continue;
+         await handleRecoveryInitiated({
+            requestId: data.requestId,
+            walletAddress: data.walletAddress,
+            initiator: data.initiator,
+            newOwner: data.newOwner,
+            initiatedLedger: Number(data.initiatedLedger),
+            earliestExecute: Number(data.earliestExecute),
+         });
+      }
+   }
+   const recoveryApprovedEvents = events.filter(event =>
+      ['recovery_approved', 'RECOVERY_APPROVED'].includes(event.eventType),
+   );
+   if (recoveryApprovedEvents.length > 0) {
+      const { handleRecoveryApproved } = await import('../wallets/social-recovery.service');
+      for (const event of recoveryApprovedEvents) {
+         const data = event as any;
+         if (typeof data.requestId !== 'string' || typeof data.guardian !== 'string') continue;
+         await handleRecoveryApproved({ requestId: data.requestId, guardian: data.guardian });
+      }
+   }
+   const recoveryCancelledEvents = events.filter(event =>
+      ['recovery_cancelled', 'RECOVERY_CANCELLED'].includes(event.eventType),
+   );
+   if (recoveryCancelledEvents.length > 0) {
+      const { handleRecoveryCancelled } = await import('../wallets/social-recovery.service');
+      for (const event of recoveryCancelledEvents) {
+         const data = event as any;
+         if (typeof data.requestId !== 'string') continue;
+         await handleRecoveryCancelled({ requestId: data.requestId });
+      }
+   }
+   const recoveryExecutedEvents = events.filter(event =>
+      ['recovery_executed', 'RECOVERY_EXECUTED'].includes(event.eventType),
+   );
+   if (recoveryExecutedEvents.length > 0) {
+      const { handleRecoveryExecuted } = await import('../wallets/social-recovery.service');
+      for (const event of recoveryExecutedEvents) {
+         const data = event as any;
+         if (typeof data.requestId !== 'string') continue;
+         await handleRecoveryExecuted({ requestId: data.requestId });
+      }
+   }
+   // #1351: limit order escrow lifecycle (create / fill / cancel / expiry reclaim).
+   const escrowCreatedEvents = events.filter(event =>
+      ['order_created', 'ORDER_CREATED'].includes(event.eventType),
+   );
+   if (escrowCreatedEvents.length > 0) {
+      const { handleOrderCreated } = await import('../orders/escrow-order.service');
+      for (const event of escrowCreatedEvents) {
+         const data = event as any;
+         if (typeof data.orderId !== 'string' || typeof data.wallet !== 'string' || typeof data.keyId !== 'string') continue;
+         if (!Number.isInteger(Number(data.ledger))) continue;
+         try {
+            await handleOrderCreated({
+               orderId: data.orderId,
+               wallet: data.wallet,
+               keyId: data.keyId,
+               side: typeof data.side === 'string' ? data.side : 'buy',
+               lockedAmount: BigInt(data.lockedAmount ?? 0),
+               limitPrice: BigInt(data.limitPrice ?? 0),
+               expiryLedger: Number.isFinite(Number(data.expiryLedger)) ? Number(data.expiryLedger) : undefined,
+               ledger: Number(data.ledger),
+            });
+         } catch { /* malformed event ignored */ }
+      }
+   }
+   const escrowFilledEvents = events.filter(event =>
+      ['order_filled', 'ORDER_FILLED'].includes(event.eventType),
+   );
+   if (escrowFilledEvents.length > 0) {
+      const { handleOrderFilled } = await import('../orders/escrow-order.service');
+      for (const event of escrowFilledEvents) {
+         const data = event as any;
+         if (typeof data.fillId !== 'string' || typeof data.orderId !== 'string' || typeof data.keeper !== 'string') continue;
+         if (!Number.isInteger(Number(data.ledger))) continue;
+         try {
+            await handleOrderFilled({
+               fillId: data.fillId,
+               orderId: data.orderId,
+               keeper: data.keeper,
+               fillPrice: BigInt(data.fillPrice ?? 0),
+               fillAmount: BigInt(data.fillAmount ?? 0),
+               keeperReward: BigInt(data.keeperReward ?? 0),
+               ledger: Number(data.ledger),
+            });
+         } catch { /* malformed event ignored */ }
+      }
+   }
+   const escrowCancelledEvents = events.filter(event =>
+      ['order_cancelled', 'ORDER_CANCELLED'].includes(event.eventType),
+   );
+   if (escrowCancelledEvents.length > 0) {
+      const { handleOrderCancelled } = await import('../orders/escrow-order.service');
+      for (const event of escrowCancelledEvents) {
+         const data = event as any;
+         if (typeof data.orderId !== 'string') continue;
+         await handleOrderCancelled({ orderId: data.orderId });
+      }
+   }
+   const escrowExpiredEvents = events.filter(event =>
+      ['order_expired', 'ORDER_EXPIRED', 'order_expiry_reclaim', 'ORDER_EXPIRY_RECLAIM'].includes(event.eventType),
+   );
+   if (escrowExpiredEvents.length > 0) {
+      const { handleOrderExpiryReclaim } = await import('../orders/escrow-order.service');
+      for (const event of escrowExpiredEvents) {
+         const data = event as any;
+         if (typeof data.orderId !== 'string') continue;
+         await handleOrderExpiryReclaim({ orderId: data.orderId });
+      }
+   }
+   const tradedKeys = new Set(events.filter(isTradeEvent).map(event => event.creatorId).filter((id): id is string => typeof id === 'string'));
+   if (tradedKeys.size > 0) {
+      const { lockFeeSchedule } = await import('../keys/fee-schedule.service');
+      for (const keyId of tradedKeys) await lockFeeSchedule(keyId);
+   }
+   const upgradeEvents = events.filter(event =>
+      ['upgrade_scheduled', 'upgrade_executed', 'upgrade_cancelled'].includes(event.eventType)
+   );
+   if (upgradeEvents.length > 0) {
+      const { processContractUpgradeEvents } = await import('../protocol/upgrade.service');
+      await processContractUpgradeEvents(upgradeEvents);
+   }
+   const protocolFeeChangeEvents = events.filter(event =>
+      ['fee_change_queued', 'fee_change_executed', 'fee_change_cancelled'].includes(event.eventType)
+   );
+   if (protocolFeeChangeEvents.length > 0) {
+      const { processProtocolFeeChangeEvents } = await import('../protocol/fee-change.service');
+      await processProtocolFeeChangeEvents(protocolFeeChangeEvents);
+   }
+   const invoiceEvents = events.filter(event =>
+      INVOICE_PROTOCOL_EVENT_TYPES.has(
+         canonicalInvoiceEventType(event.eventType)
+      )
+   );
+   if (invoiceEvents.length) {
+      const { processInvoiceProtocolEvents } =
+         await import('./invoice-protocol-indexer.service');
+      await processInvoiceProtocolEvents(invoiceEvents);
+   }
+   const spotlightBidEvents = events.filter(event =>
+      ['SpotlightBidPlaced', 'SPOTLIGHT_BID_PLACED', 'SpotlightAwarded', 'SPOTLIGHT_AWARDED'].includes(event.eventType)
+   );
+   if (spotlightBidEvents.length > 0) {
+      const { processSpotlightBidEvents } = await import('./spotlight-bid-indexer.service');
+      await processSpotlightBidEvents(spotlightBidEvents);
+   }
+   const tradeEvents = events.filter(isTradeEvent);
+   const dividendEvents = events.filter(
+      event =>
+         event.eventType === 'DividendSnapshotCreated' ||
+         event.eventType === 'DIVIDEND_SNAPSHOT_CREATED' ||
+         event.eventType === 'DIVIDEND_DISTRIBUTED' ||
+         event.eventType === 'DividendClaimed' ||
+         event.eventType === 'DIVIDEND_CLAIMED'
+   );
+   const revenueShareEvents = events.filter(
+      event =>
+         event.eventType === 'RevenueDistributed' ||
+         event.eventType === 'REVENUE_DISTRIBUTED' ||
+         event.eventType === 'RevenueShareClaimed' ||
+         event.eventType === 'REVENUE_SHARE_CLAIMED'
+   );
+   const socialEvents = events.filter(
+      event => event.eventType === SOCIAL_METADATA_UPDATED_EVENT_TYPE
+   );
+   const subscriptionEvents = events.filter(
+      event => event.eventType === 'SubscriptionCreated' || event.eventType === 'SUBSCRIPTION_CREATED'
+   );
+
+   if (socialEvents.length > 0) {
+      await processSocialMetadataEvents(socialEvents);
+   }
+
+   // TWAPUpdated (#1082). Awaited before the cursor moves: if this throws,
+   // the cursor stays put and the whole batch is redelivered, which is what
+   // keeps the twap_snapshots history free of gaps.
+   // Lazy import, as for the bundle indexer, so Redis is only loaded when a
+   // TWAP event actually arrives.
+   const twapEvents = events.filter(
+      event =>
+         event.eventType === 'TWAP_UPDATED' || event.eventType === 'TWAPUpdated'
+   );
+   if (twapEvents.length > 0) {
+      const { processTwapUpdatedEvents } =
+         await import('./twap-indexer.service');
+      await processTwapUpdatedEvents(twapEvents);
+   }
+
+   // SnapshotTaken (#1112). Awaited before the cursor moves so a failure
+   // redelivers the batch and key_snapshots never misses a day.
+   const snapshotEvents = events.filter(
+      event =>
+         event.eventType === 'SNAPSHOT_TAKEN' ||
+         event.eventType === 'SnapshotTaken'
+   );
+   if (snapshotEvents.length > 0) {
+      const { processSnapshotTakenEvents } =
+         await import('./key-snapshot-indexer.service');
+      await processSnapshotTakenEvents(snapshotEvents);
+   }
+
+   // DepthUpdated (#1152). Awaited before the cursor moves so a failure
+   // redelivers the batch and key_depth never misses a level change.
+   const depthEvents = events.filter(
+      event =>
+         event.eventType === 'DEPTH_UPDATED' ||
+         event.eventType === 'DepthUpdated'
+   );
+   if (depthEvents.length > 0) {
+      const { processDepthUpdatedEvents } =
+         await import('./key-depth-indexer.service');
+      await processDepthUpdatedEvents(depthEvents);
+   }
+
+   // LeaderboardUpdated events. Await before advancing the shared
+   // cursor so a failed write causes the event batch to be redelivered.
+   const leaderboardEvents = events.filter(event =>
+      ['LEADERBOARD_UPDATED', 'LeaderboardUpdated'].includes(event.eventType)
+   );
+   if (leaderboardEvents.length > 0) {
+      const { processLeaderboardUpdatedEvents } =
+         await import('./key-leaderboard-indexer.service');
+      await processLeaderboardUpdatedEvents(leaderboardEvents);
+   }
+
+   const whitelistEvents = events.filter(
+      event =>
+         event.eventType === 'WalletWhitelisted' ||
+         event.eventType === 'WALLET_WHITELISTED' ||
+         event.eventType === 'WHITELIST_ADDED' ||
+         event.eventType === 'WalletRemovedFromWhitelist' ||
+         event.eventType === 'WALLET_REMOVED_FROM_WHITELIST' ||
+         event.eventType === 'WHITELIST_REMOVED'
+   );
+   if (whitelistEvents.length > 0) {
+      const { processWhitelistEvents } = await import(
+         './whitelist-indexer.service'
+      );
+      await processWhitelistEvents(whitelistEvents);
+   }
+
+   // Governance lifecycle events (PROPOSAL_CREATED / VOTE_CAST /
+   // PROPOSAL_EXECUTED). Processed in order before the cursor moves so a
+   // batch that creates a proposal and records its votes stays consistent.
+   const governanceEvents = events.filter(isGovernanceProposalEvent);
+   if (governanceEvents.length > 0) {
+      const { processGovernanceProposalEvents } =
+         await import('./governance-proposal-indexer.service');
+      await processGovernanceProposalEvents(governanceEvents);
+   }
+
+   const { isConvictionEvent, processConvictionEvents } =
+      await import('./conviction-indexer.service');
+   const convictionEvents = events.filter(isConvictionEvent);
+   if (convictionEvents.length > 0) {
+      await processConvictionEvents(convictionEvents);
+   }
+
+   // Subscription status cache (#1079): awaited before the cursor moves so a
+   // failed write redelivers the batch instead of leaving a stale status.
+   for (const event of subscriptionEvents) {
+      await processSubscriptionCreatedEvent(event as Record<string, unknown>);
+   }
+
+   // Protocol pause and escape-hatch events (#1265). Awaited before the cursor
+   // moves; the unique (txHash, eventIndex) keys keep replays idempotent.
+   const {
+      isProtocolEscapeEvent,
+      processProtocolEscapeEvents,
+   } = await import('./protocol-escape-indexer.service');
+   const protocolEscapeEvents = events.filter(isProtocolEscapeEvent);
+   if (protocolEscapeEvents.length > 0) {
+      await processProtocolEscapeEvents(protocolEscapeEvents);
+   }
+
+   // Token rescues (#1271). Awaited before the cursor moves, so a failed write
+   // redelivers the batch and the unique (txHash, eventIndex) key keeps it idempotent.
+   const {
+      isTokenRescueEvent,
+      processTokenRescueEvents,
+   } = await import('./token-rescue-indexer.service');
+   const tokenRescueEvents = events.filter(isTokenRescueEvent);
+   if (tokenRescueEvents.length > 0) {
+      await processTokenRescueEvents(tokenRescueEvents);
+   }
+
+   // Community poll events are processed in chain order before advancing the
+   // shared cursor, so a vote or close cannot be skipped after a failed write.
+   const keyPollEvents = events.filter(isKeyPollEvent);
+   if (keyPollEvents.length > 0) {
+      const { processKeyPollEvents } =
+         await import('./key-poll-indexer.service');
+      await processKeyPollEvents(keyPollEvents);
+   }
+
+   const {
+      isBalanceChangeEvent,
+      processBalanceChangeEvents,
+   } = await import('./balance-checkpoint-indexer.service');
+   const balanceChangeEvents = events.filter(isBalanceChangeEvent);
+   if (balanceChangeEvents.length > 0) {
+      await processBalanceChangeEvents(balanceChangeEvents);
+   }
+
+   const { CURVE_UPDATE_EVENT_TYPES, processCurveUpdateEvents } =
+      await import('./curve-update-indexer.service');
+   const curveUpdateEvents = events.filter(event =>
+      CURVE_UPDATE_EVENT_TYPES.has(event.eventType)
+   );
+   if (curveUpdateEvents.length > 0) {
+      await processCurveUpdateEvents(curveUpdateEvents);
+   }
+
+   const { isPaymentAssetEvent, processPaymentAssetEvents } =
+      await import('./payment-asset-indexer.service');
+   const paymentAssetEvents = events.filter(isPaymentAssetEvent);
+   if (paymentAssetEvents.length > 0) {
+      await processPaymentAssetEvents(paymentAssetEvents);
+   }
+
+   const { isBountyEvent, processBountyEvents } =
+      await import('./bounty-indexer.service');
+   const bountyEvents = events.filter(isBountyEvent);
+   if (bountyEvents.length > 0) {
+      await processBountyEvents(bountyEvents);
+   }
+
+   const {
+      MILESTONE_REWARD_CLAIMED_EVENT_TYPES,
+      processMilestoneRewardClaimedEvents,
+   } = await import('./milestone-claim-indexer.service');
+   const milestoneClaimEvents = events.filter(event =>
+      MILESTONE_REWARD_CLAIMED_EVENT_TYPES.has(event.eventType)
+   );
+   if (milestoneClaimEvents.length > 0) {
+      await processMilestoneRewardClaimedEvents(milestoneClaimEvents);
+   }
+
+   const { KEY_RETIREMENT_EVENT_TYPES, processKeyRetirementEvents } =
+      await import('./key-retirement-indexer.service');
+   const retirementEvents = events.filter(event =>
+      KEY_RETIREMENT_EVENT_TYPES.has(event.eventType)
+   );
+   if (retirementEvents.length > 0) {
+      await processKeyRetirementEvents(retirementEvents);
+   }
+
+   const { KEY_LAUNCH_AUCTION_EVENT_TYPES, processKeyLaunchAuctionEvents } =
+      await import('./key-launch-auction-indexer.service');
+   const launchAuctionEvents = events.filter(event =>
+      KEY_LAUNCH_AUCTION_EVENT_TYPES.has(event.eventType)
+   );
+   if (launchAuctionEvents.length > 0) {
+      await processKeyLaunchAuctionEvents(launchAuctionEvents);
+   }
+
+   const { DUTCH_AUCTION_EVENT_TYPES, processDutchAuctionEvents } = await import(
+      './dutch-auction-indexer.service'
+   );
+   const dutchAuctionEvents = events.filter(event =>
+      DUTCH_AUCTION_EVENT_TYPES.has(event.eventType)
+   );
+   if (dutchAuctionEvents.length > 0) {
+      await processDutchAuctionEvents(dutchAuctionEvents);
+   }
+
+   const {
+      COMMIT_REVEAL_LAUNCH_EVENT_TYPES,
+      processCommitRevealLaunchEvents,
+   } = await import('./commit-reveal-launch-indexer.service');
+   const commitRevealLaunchEvents = events.filter(event =>
+      COMMIT_REVEAL_LAUNCH_EVENT_TYPES.has(event.eventType)
+   );
+   if (commitRevealLaunchEvents.length > 0) {
+      await processCommitRevealLaunchEvents(commitRevealLaunchEvents);
+   }
+
+   const { PASS_EVENT_TYPES, processPassEvents } = await import(
+      './pass-event-indexer.service'
+   );
+   const passEvents = events.filter(event =>
+      PASS_EVENT_TYPES.has(event.eventType)
+   );
+   if (passEvents.length > 0) {
+      await processPassEvents(passEvents);
+   }
+
+   if (tradeEvents.length > 0) {
+      await processTradeEvents(tradeEvents, { advanceCursor: false });
+   }
+
+   if (dividendEvents.length > 0) {
+      const { processDividendEvents } =
+         await import('./dividend-indexer.service');
+      await processDividendEvents(dividendEvents, { advanceCursor: false });
+   }
+
+   if (revenueShareEvents.length > 0) {
+      const { processRevenueShareEvents } =
+         await import('./revenue-share-indexer.service');
+      await processRevenueShareEvents(revenueShareEvents);
+   }
+
+   const { isLpEventType, processLpEvents } =
+      await import('./lp-indexer.service');
+   const lpEvents = events.filter(event => isLpEventType(event.eventType));
+   if (lpEvents.length > 0) {
+      await processLpEvents(lpEvents);
+   }
+
+   // Co-creator roster (#1139). Awaited before the cursor moves so a
+   // failure redelivers the batch and the roster never misses a change.
+   const coCreatorEvents = events.filter(
+      event =>
+         event.eventType === 'CO_CREATOR_ADDED' ||
+         event.eventType === 'CoCreatorAdded' ||
+         event.eventType === 'CO_CREATOR_SET' ||
+         event.eventType === 'CoCreatorSet' ||
+         event.eventType === 'co_set' ||
+         event.eventType === 'CO_CREATOR_REMOVED' ||
+         event.eventType === 'CoCreatorRemoved' ||
+         event.eventType === 'cc_rm'
+   );
+   if (coCreatorEvents.length > 0) {
+      const { processCoCreatorEvents } = await import(
+         './co-creator-indexer.service'
+      );
+      await processCoCreatorEvents(coCreatorEvents);
+   }
+
+   // Reserve balance (#1140): ReserveAccrued / ReserveDeployed.
+   const reserveEvents = events.filter(
+      event =>
+         event.eventType === 'RESERVE_ACCRUED' ||
+         event.eventType === 'ReserveAccrued' ||
+         event.eventType === 'RESERVE_DEPLOYED' ||
+         event.eventType === 'ReserveDeployed'
+   );
+   if (reserveEvents.length > 0) {
+      const { processReserveEvents } = await import(
+         './reserve-indexer.service'
+      );
+      await processReserveEvents(reserveEvents);
+   }
+
+   // Tip history (#1132): TipSent.
+   const tipEvents = events.filter(
+      event =>
+         event.eventType === 'TIP_SENT' ||
+         event.eventType === 'TipSent' ||
+         event.eventType === 'tip'
+   );
+   if (tipEvents.length > 0) {
+      const { processTipEvents } = await import('./tip-indexer.service');
+      await processTipEvents(tipEvents);
+   }
+
+   // Treasury, early incentive slots, issuer verification and health score
+   // (#1178, #1179, #1180, #1181). Awaited before the cursor moves so a failure
+   // redelivers the batch instead of leaving a gap in the read models.
+   const { TREASURY_EVENT_TYPES, processTreasuryEvents } =
+      await import('./treasury-indexer.service');
+   const treasuryEvents = events.filter(event =>
+      TREASURY_EVENT_TYPES.has(event.eventType)
+   );
+   if (treasuryEvents.length > 0) {
+      await processTreasuryEvents(treasuryEvents);
+   }
+
+   const { EARLY_SLOT_FILLED_EVENT_TYPES, processEarlySlotFilledEvents } =
+      await import('./early-incentive-indexer.service');
+   const earlySlotEvents = events.filter(event =>
+      EARLY_SLOT_FILLED_EVENT_TYPES.has(event.eventType)
+   );
+   if (earlySlotEvents.length > 0) {
+      await processEarlySlotFilledEvents(earlySlotEvents);
+   }
+
+   const {
+      ISSUER_VERIFICATION_EVENT_TYPES,
+      processIssuerVerificationEvents,
+   } = await import('./issuer-verification-indexer.service');
+   const verificationEvents = events.filter(event =>
+      ISSUER_VERIFICATION_EVENT_TYPES.has(event.eventType)
+   );
+   if (verificationEvents.length > 0) {
+      await processIssuerVerificationEvents(verificationEvents);
+   }
+
+   const {
+      HEALTH_SCORE_UPDATED_EVENT_TYPES,
+      processHealthScoreEvents,
+   } = await import('./health-score-indexer.service');
+   const healthScoreEvents = events.filter(event =>
+      HEALTH_SCORE_UPDATED_EVENT_TYPES.has(event.eventType)
+   );
+   if (healthScoreEvents.length > 0) {
+      await processHealthScoreEvents(healthScoreEvents);
+   }
+
+   const { BADGE_MINTED_EVENT_TYPES, processBadgeMintedEvents } =
+      await import('./badge-minted-indexer.service');
+   const badgeMintedEvents = events.filter(event =>
+      BADGE_MINTED_EVENT_TYPES.has(event.eventType)
+   );
+   if (badgeMintedEvents.length > 0) {
+      await processBadgeMintedEvents(badgeMintedEvents);
+   }
+
+   const { STAKING_EPOCH_EVENT_TYPES, processStakingEpochEvents } =
+      await import('./staking-epoch-indexer.service');
+   const stakingEpochEvents = events.filter(event =>
+      STAKING_EPOCH_EVENT_TYPES.has(event.eventType)
+   );
+   if (stakingEpochEvents.length > 0) {
+      await processStakingEpochEvents(stakingEpochEvents);
+   }
+
+   const campaignEvents = events.filter(event =>
+      ['CampaignCreated', 'CAMPAIGN_CREATED', 'campaign_created', 'WalletQualified',
+         'WALLET_QUALIFIED', 'wallet_qualified', 'RewardClaimed', 'REWARD_CLAIMED',
+         'reward_claimed', 'camp_new', 'qual', 'claim'].includes(event.eventType) &&
+         (event.campaignId !== undefined || event.campaign_id !== undefined));
+   if (campaignEvents.length) {
+      const { processCampaignEvents } = await import('./campaign-indexer.service');
+      await processCampaignEvents(campaignEvents);
+   }
+   const delegationEvents = events.filter(event =>
+      ['DELEGATION_SET', 'VotingDelegated', 'VOTING_DELEGATED', 'voting_delegated',
+         'DELEGATION_REVOKED', 'DelegationRevoked', 'delegation_revoked'].includes(event.eventType));
+   if (delegationEvents.length) {
+      const { processVotingDelegationEvents } =
+         await import('../governance/governance-delegation-indexer.service');
+      await processVotingDelegationEvents(delegationEvents);
+   }
+   const polEvents = events.filter(event =>
+      ['pol_funded', 'POL_FUNDED', 'PolFunded', 'backstop_applied', 'BACKSTOP_APPLIED',
+         'BackstopApplied', 'backstop_repaid', 'BACKSTOP_REPAID', 'BackstopRepaid'].includes(event.eventType));
+   if (polEvents.length) {
+      const { processPolEvents } = await import('../pol/pol-indexer.service');
+      await processPolEvents(polEvents);
+   }
+   const scheduledEvents = events.filter(event =>
+      /^(transfer_scheduled|TransferScheduled|TRANSFER_SCHEDULED|transfer_claimed|TransferClaimed|TRANSFER_CLAIMED|transfer_cancelled|TransferCancelled|TRANSFER_CANCELLED)$/.test(event.eventType));
+   if (scheduledEvents.length) {
+      const { processScheduledTransferEvents } = await import('./scheduled-transfer-indexer.service');
+      await processScheduledTransferEvents(scheduledEvents);
+   }
+   const marketplaceEvents = events.filter(event =>
+      ['marketplaceapproved', 'marketplacerevoked', 'royaltyenforcementset'].includes(
+         event.eventType.replace(/[^a-z]/gi, '').toLowerCase()));
+   if (marketplaceEvents.length) {
+      const { processMarketplaceEvents } = await import('./marketplace-indexer.service');
+      await processMarketplaceEvents(marketplaceEvents);
+   }
+   const airdropEvents = events.filter(event =>
+      ['airdrop_claimed', 'AirdropClaimed', 'AIRDROP_CLAIMED'].includes(event.eventType));
+   if (airdropEvents.length) {
+      const { processAirdropClaimEvents } = await import('./airdrop-indexer.service');
+      await processAirdropClaimEvents(airdropEvents);
+   }
+
+   const { PRICE_CEILING_EVENT_TYPES, processPriceCeilingEvents } =
+      await import('./price-ceiling-indexer.service');
+   const priceCeilingEvents = events.filter(event =>
+      PRICE_CEILING_EVENT_TYPES.has(event.eventType)
+   );
+   if (priceCeilingEvents.length > 0) {
+      await processPriceCeilingEvents(priceCeilingEvents);
+   }
+
+   if (options.advanceCursor !== false)
+      await advanceIndexerCursorForBatch(events);
 }
 
 function computeBatchHash(
@@ -259,7 +1087,7 @@ function computeBatchHash(
 export async function processSunsetFlaggedEvents(
    events: IndexerChainEvent[]
 ): Promise<void> {
-   await processIndexerChainEvents(events, async (event) => {
+   await processIndexerChainEvents(events, async event => {
       if (event.eventType !== 'KEY_SUNSET_FLAGGED') {
          return;
       }

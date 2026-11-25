@@ -2,6 +2,34 @@
 
 Base URL: `http://localhost:3000/api/v1`
 
+## Tips Endpoints
+
+### GET /tips/:tip_id/content
+
+Get the message content associated with a `TipSent` event. The first request
+fetches the event's IPFS content hash through the configured Pinata gateway and
+caches the result permanently in `tip_content`. Cached content is not fetched
+again. Content is limited to 500 characters when stored.
+
+- **Auth:** None
+- **Response:** `200 OK` when content is fetched or unavailable; `404 Not Found`
+  when the tip does not exist
+
+```json
+{
+   "success": true,
+   "data": {
+      "tip_id": "tip-123",
+      "content": "Thanks for your work!",
+      "content_unavailable": false
+   }
+}
+```
+
+If the IPFS request times out after 5 seconds (or the gateway cannot provide
+the content), `content` is `null` and `content_unavailable` is `true`. Failed
+fetches are not cached.
+
 ## Health Endpoints
 
 ### GET /health
@@ -157,6 +185,62 @@ Get public stats for a specific creator.
 }
 ```
 
+### GET /creators/:wallet/social
+
+Get the on-chain synced social metadata for a creator, keyed by wallet
+address, creator id, or handle (`:wallet` accepts any of the three).
+
+- **Auth:** None
+- **Headers:** `Cache-Control: public, max-age=60` (short TTL so on-chain
+  social updates propagate within ~60 seconds)
+- **Response:** `200 OK`
+
+```json
+{
+   "success": true,
+   "data": {
+      "creatorId": "...",
+      "handle": "ada",
+      "wallet": "GWALLET...",
+      "displayName": "Ada Artist",
+      "bio": "On-chain bio",
+      "avatarUrl": "https://gateway.pinata.cloud/ipfs/bafy...",
+      "avatarCid": "bafy...",
+      "links": [{ "label": "X", "url": "https://x.com/ada" }],
+      "synced": true,
+      "updatedAt": "2026-10-17T10:00:00.000Z",
+      "source": { "ledger": 500, "txHash": "tx-social-1", "eventIndex": 0 }
+   }
+}
+```
+
+When no `SocialMetadataUpdated` event has been indexed for the creator yet, the
+endpoint still returns `200 OK` with `synced: false`, `links: []`, and `null`
+display/bio/avatar fields plus a `null` `source`. The avatar is resolved from
+its IPFS CID via `PINATA_GATEWAY_URL`. See
+[social-metadata-sync.md](./social-metadata-sync.md) for the sync details.
+
+## Creator Revenue Distribution Endpoints
+
+### GET /keys/:keyId/revenue-distributions
+
+Return indexed revenue distributions for a creator key, newest first.
+
+- **Auth:** None
+- **Query Params:** `limit` (1-100, default 50), `cursor` (distribution cursor)
+- **Response:** Each entry includes `distributionId`, `distributedAt`, `amount`,
+  and `holderCount`, along with cursor pagination metadata.
+- **Cache:** 60 seconds; invalidated when a new distribution is indexed.
+
+### GET /keys/:keyId/revenue-distributions/:wallet
+
+Return the wallet's claimable and claimed amounts for each indexed distribution.
+
+- **Auth:** None
+- **Response:** Distribution entries include `claimableAmount` and
+  `claimedAmount` in addition to the distribution date, amount, and holder count.
+- **Cache:** 60 seconds; invalidated when a distribution or claim is indexed.
+
 ---
 
 ## Creator Profile Endpoints
@@ -281,7 +365,219 @@ GET /invoices/compare?ids=cm123,cm456
 
 ---
 
+### GET /invoices/:invoice_id/early-incentive
+
+Early funding incentive slot status for an invoice. `slots_filled` counts indexed
+`EarlySlotFilled` events and is capped at `slots_total`. Configuration comes from
+the most recent event. Responses are cached for 30 seconds.
+
+- **Auth:** None
+- **Response:** `200 OK`; `404` when the invoice does not exist. An invoice with
+  no incentive configured returns `is_active: false`.
+
+```json
+{
+   "success": true,
+   "data": {
+      "invoice_id": "cm123",
+      "slots_total": 10,
+      "slots_filled": 4,
+      "slots_remaining": 6,
+      "bonus_bps": 250,
+      "is_active": true
+   }
+}
+```
+
+---
+
+## Issuer Endpoints
+
+### GET /issuers/:wallet/verification
+
+Verification badge status for an issuer. `is_verified` is `false` for revoked,
+expired, or never-verified issuers, and `tier` is `null` in those cases.
+`days_remaining` is `null` for a grant with no expiry. Responses are cached for 60
+seconds.
+
+- **Auth:** None
+- **Response:** `200 OK`; `400` for an invalid Stellar wallet
+
+```json
+{
+   "success": true,
+   "data": {
+      "wallet": "GISSUER...",
+      "is_verified": true,
+      "tier": "GOLD",
+      "expiry_timestamp": "2027-01-01T00:00:00.000Z",
+      "days_remaining": 71
+   }
+}
+```
+
+### GET /issuers/verified
+
+Paginated list of currently verified issuers.
+
+- **Auth:** None
+- **Query:** `page` (default `1`), `limit` (default `20`, max `100`)
+- **Response:** `200 OK` with `meta` pagination
+
+---
+
+## Investor Endpoints
+
+### GET /investors/:wallet/health-score
+
+Portfolio health score for a wallet, read from the health-score contract's
+`get_health_score` and cached for 5 minutes. `score` and `factors` are `null` for
+a wallet with no portfolio. Requires `PORTFOLIO_HEALTH_CONTRACT_ID`; without it the
+endpoint returns `503`.
+
+- **Auth:** None
+- **Response:** `200 OK`; `400` for an invalid wallet; `503` when the contract is
+  not configured or the read fails
+
+```json
+{
+   "success": true,
+   "data": {
+      "wallet": "GINVESTOR...",
+      "score": 742,
+      "factors": {
+         "concentration_score": 80,
+         "maturity_distribution_score": 70,
+         "issuer_diversity_score": 65,
+         "default_exposure_score": 90
+      },
+      "computed_at": "2026-10-21T10:00:00.000Z"
+   }
+}
+```
+
+---
+
 ## Admin Endpoints
+
+### GET /admin/reports
+
+Moderator queue of key reports (#1226), newest first (`createdAt` desc, then
+`id` desc).
+
+- **Auth:** Wallet JWT for a wallet listed in `MODERATOR_WALLETS`. Other wallets
+  get `403`; missing/invalid tokens get `401`.
+- **Query Params:**
+   - `status` (optional): `open`, `reviewing`, `dismissed` or `actioned`
+   - `cursor` (optional): opaque `meta.nextCursor` value from the previous page
+   - `limit` (optional): integer `1`–`100`, default `20`
+- **Response:** `200 OK`
+
+```json
+{
+   "success": true,
+   "data": {
+      "data": [
+         {
+            "id": "cm123...",
+            "keyId": "cm456...",
+            "reporter": "GREPORTER...",
+            "reason": "scam",
+            "details": null,
+            "status": "open",
+            "createdAt": "2026-11-20T10:00:00.000Z",
+            "updatedAt": "2026-11-20T10:00:00.000Z"
+         }
+      ],
+      "meta": { "limit": 20, "hasMore": true, "nextCursor": "eyJj...abc" }
+   }
+}
+```
+
+- **Errors:** `400` invalid `status`, `limit` or `cursor`; `401`; `403`.
+
+### PATCH /admin/reports/:id
+
+Move a key report through the moderation lifecycle (#1226).
+
+- **Auth:** Moderator wallet JWT (see `GET /admin/reports`)
+- **Body:** `{ "status": "reviewing" | "dismissed" | "actioned" }`
+- **Allowed transitions:**
+
+| From        | To                                   |
+| ----------- | ------------------------------------ |
+| `open`      | `reviewing`, `dismissed`, `actioned` |
+| `reviewing` | `dismissed`, `actioned`              |
+| `dismissed` | — (terminal)                         |
+| `actioned`  | — (terminal)                         |
+
+- **Response:** `200 OK` with the updated report (same shape as above)
+- **Errors:** `400` unknown status value (including `open`; a report cannot
+  be re-opened); `401`; `403`; `404` report not found; `409` transition not
+  allowed from the report's current status (also returned when another
+  moderator changed the status concurrently).
+
+### GET /admin/referral-holds
+
+List referrals flagged by abuse detection (#1241). A flagged referral earns
+nothing until an admin reviews it; its rewards are withheld, trade by trade,
+while the hold is `PENDING`.
+
+- **Auth:** Admin required
+- **Query:** `status` (`PENDING` | `RELEASED` | `REJECTED`, optional), `limit`,
+  `cursor` (newest first)
+- **Response:** `200 OK`
+
+```json
+{
+   "success": true,
+   "data": {
+      "items": [
+         {
+            "id": "cm123...",
+            "referralId": "cm456...",
+            "reason": "FUNDING_CLUSTER",
+            "status": "PENDING",
+            "details": {
+               "funder": "G...",
+               "refereesInWindow": 6,
+               "threshold": 5,
+               "windowHours": 24
+            },
+            "referrerAddress": "G...",
+            "refereeAddress": "G...",
+            "rewardXlm": 0.075,
+            "withheldTrades": 3,
+            "resolvedBy": null,
+            "resolvedAt": null,
+            "createdAt": "2026-11-05T12:00:01.000Z"
+         }
+      ],
+      "has_more": false,
+      "next_cursor": null
+   }
+}
+```
+
+- **Reasons:** `SELF_REFERRAL`, `LINKED_WALLETS` (one wallet funded the other)
+  and `SHARED_FUNDING_SOURCE` are rejected automatically (`REJECTED`, final).
+  `FUNDING_CLUSTER` (more than 5 referees first funded by one account within
+  24 hours) is held for review (`PENDING`).
+- **Errors:** `400` invalid `status`, `limit` or `cursor`; `401`; `403`.
+
+### PATCH /admin/referral-holds/:id
+
+Resolve a `PENDING` hold (#1241).
+
+- **Auth:** Admin required
+- **Body:** `{ "status": "RELEASED" | "REJECTED" }`
+- **Behaviour:** `RELEASED` pays every withheld reward exactly once and lets
+  later trades pay normally. `REJECTED` never pays; later trades are ignored.
+  Both are recorded in the audit log.
+- **Response:** `200 OK` with the updated hold (same shape as above)
+- **Errors:** `400` invalid id or body (including `PENDING` or extra fields);
+  `401`; `403`; `404` hold not found; `409` hold is not `PENDING` (already
+  resolved, or rejected automatically by detection).
 
 ### POST /admin/proposals
 
@@ -576,6 +872,214 @@ window, with alert and auto-suspension state.
 
 ---
 
+### GET /admin/treasury
+
+Platform treasury balance for the admin dashboard. `total_balance` is gross fee
+inflow minus allocations. `per_source_breakdown` is gross inflow per source;
+allocations are not attributed to a source. Amounts are strings in stroops.
+Cached for 60 seconds.
+
+- **Auth:** Admin JWT (`adminGuard`)
+- **Response:** `200 OK`
+
+```json
+{
+   "success": true,
+   "data": {
+      "total_balance": "1200000000",
+      "per_source_breakdown": [
+         { "source": "trading", "balance": "1500000000" }
+      ],
+      "last_updated": "2026-10-21T10:00:00.000Z"
+   }
+}
+```
+
+### GET /admin/treasury/allocations
+
+Paginated `FundsAllocated` history (`destination`, `amount`, `purpose`, `tx_hash`,
+`ledger`, `occurred_at`).
+
+- **Auth:** Admin JWT
+- **Query:** `page` (default `1`), `limit` (default `20`, max `100`)
+
+### GET /admin/treasury/inflows
+
+Paginated `FeeReceived` history (`source`, `amount`, `tx_hash`, `ledger`,
+`occurred_at`).
+
+- **Auth:** Admin JWT
+- **Query:** `page` (default `1`), `limit` (default `20`, max `100`)
+
+---
+
+## Keys Endpoints
+
+### POST /keys/:keyId/reports
+
+Report a key for moderator review (#1226). Stored with status `open`.
+
+- **Auth:** Wallet JWT (`Authorization: Bearer <token>`)
+- **Rate limit:** 5 reports per wallet per rolling hour (Redis sliding window,
+  keyed by wallet). The sixth request returns `429` with `Retry-After`.
+- **Body:**
+
+```json
+{
+   "reason": "scam",
+   "details": "Optional context, max 500 characters"
+}
+```
+
+`reason` must be one of `scam`, `impersonation`, `harassment`, `other`.
+
+- **Response:** `201 Created`
+
+```json
+{
+   "success": true,
+   "message": "Report submitted",
+   "data": {
+      "id": "cm123...",
+      "keyId": "cm456...",
+      "reporter": "GREPORTER...",
+      "reason": "scam",
+      "details": "Optional context, max 500 characters",
+      "status": "open",
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z"
+   }
+}
+```
+
+- **Errors:** `400` invalid `reason`, `details` over 500 characters or unknown
+  fields; `401` missing/invalid token; `404` key not found; `409` the wallet
+  already has an `open` report for this key; `429` rate limit exceeded.
+
+### GET /keys/:keyId/leaderboard
+
+Returns wallets ranked by the selected `LeaderboardUpdated` metric. Results
+are cached for 60 seconds and the cache is invalidated when a new event is
+indexed for the key. Keys without indexed leaderboard rows return an empty
+`items` array.
+
+- **Auth:** None
+- **Query Params:** `metric` (`volume`, `pnl`, or `holding_days`, required),
+  `limit` (integer, default `20`, maximum `100`)
+- **Response:** `{ "success": true, "data": { "items": [{ "rank": 1, "wallet": "...", "score": "..." }] } }`
+
+### GET /keys/:keyId/leaderboard/:wallet
+
+Returns the wallet's ordinal rank and exact score for each leaderboard metric.
+Each metric is `null` when the wallet has no indexed entry for the key.
+
+- **Auth:** None
+- **Response:** `{ "success": true, "data": { "keyId": "...", "wallet": "...", "metrics": { "volume": { "rank": 1, "score": "..." }, "pnl": null, "holding_days": null } } }`
+
+### GET /keys/:keyId/price
+
+Returns the current bonding-curve buy and sell price for a given quantity of
+keys. Resolves `keyId` by database id **or** handle. All bigint values are
+serialised as strings. Response is cached in Redis for 10 seconds.
+
+- **Auth:** None
+- **Query Params:**
+   - `quantity` (integer, 1–1 000 000, default `1`) — number of keys to price
+
+- **Response:** `200 OK`
+
+```json
+{
+   "success": true,
+   "data": {
+      "keyId": "cm_creator_abc",
+      "quantity": 5,
+      "currentSupply": "100",
+      "buy": {
+         "unitPrice": "11250000",
+         "totalCost": "56250000"
+      },
+      "sell": {
+         "unitPrice": "10750000",
+         "totalProceeds": "53750000"
+      },
+      "priceImpactPercent": "2.27"
+   }
+}
+```
+
+> `sell` is `null` when `quantity` exceeds the current circulating supply.
+
+- **Error Responses:**
+   - `400 Bad Request` — `quantity` is missing, non-integer, ≤ 0, or > 1 000 000
+   - `404 Not Found` — key does not exist
+
+### Community Polls
+
+Polls are indexed from `PollCreated`, `PollVoteCast`, and `PollClosed` contract
+events. Results report vote counts and summed vote weight per option. Responses
+are cached for 30 seconds and invalidated when a poll event for the key is
+indexed.
+
+#### GET /keys/:keyId/polls
+
+Returns one page of polls as `{ items, nextCursor }`, newest expiry first. Each
+item has total votes, total voting weight, per-option weight tallies, and
+`timeRemainingSeconds` (`0` once closed).
+
+Query parameters: `status` (`active`, `closed` or `all`, default `all`),
+`cursor` (the `nextCursor` from the previous page), and `limit` (1 to 100,
+default 20). A `cursor` that does not name a poll for the key returns `400`.
+Pages are cached for 30 seconds and invalidated by vote and close events.
+
+#### GET /keys/:keyId/polls/:pollId
+
+Returns poll details and per-option vote counts and weights in `optionResults`.
+Pass `?wallet=G...` to include `walletVote`, the wallet's vote for this poll.
+
+#### GET /keys/:keyId/polls/:pollId/votes/:wallet
+
+Returns whether the wallet voted and, if so, its selected option and indexed
+vote weight. Invalid Stellar wallet addresses return `400`; unknown keys or
+polls return `404`.
+
+#### GET /analytics/keys/leaderboard
+
+Ranks all keys by `metric`, which is `volume` (24h trade value, the default),
+`holders` (positive balances) or `reputation` (creator reputation score). Each
+entry has `rank`, `key_id`, `key_name`, `creator`, `metric_value` and
+`24h_change`. `24h_change` is the percent change in key price between the
+latest daily snapshot and the one a UTC day earlier, or `null` when that pair
+is missing. `limit` defaults to 20 and is capped at 100; larger values return
+`400`. Rankings are cached for 5 minutes and rebuilt by the analytics job.
+
+#### GET /admin/rescues
+
+Admin only (`403` for other roles). Returns token rescues newest first as
+`{ items, nextCursor, totals }`, with optional `token`, `cursor` and `limit`
+(1 to 100, default 20) query parameters. `totals` has per-token running totals.
+
+#### GET /transparency/rescues
+
+Public, no authentication. Returns `{ totals }`, with each token's
+`totalAmount`, `rescueCount` and `lastRescueLedger`. Recipient, admin and
+transaction hash are not included.
+
+#### GET /protocol/escape
+
+Returns `pausedSince`, `escapeEnabledAtLedger`, `active` and `currentLedger`.
+Escape opens `PROTOCOL_ESCAPE_DELAY_LEDGERS` ledgers after the pause and is
+`active` once the indexed ledger reaches that point.
+
+#### GET /wallets/:address/escape
+
+Returns the wallet's `escape` status and its `holdings`. Each holding has
+`balance`, `circulatingSupply`, `reserveBalance`, `redeemed` and
+`estimatedRecoverable` (balance / circulating supply x reserve, rounded down to
+7 decimals). Redeemed positions estimate to zero. Invalid addresses return `400`.
+
+---
+
 ## Common Headers
 
 | Header             | Description                               |
@@ -606,3 +1110,24 @@ window, with alert and auto-suspension state.
 ---
 
 See [Local Setup](./local-setup.md) for development environment configuration.
+
+## Dividend Snapshot Endpoints
+
+### GET /keys/:keyId/dividends
+
+List dividend snapshots for a key, newest first. Use `limit` (1–100, default 50) and the returned `pagination.nextCursor` to request the next page.
+
+Each entry includes `totalDistributed`, `claimWindowStart`, and
+`claimWindowEnd`. The legacy `totalAmount` and `distributionId` fields are
+retained for compatibility.
+
+### GET /keys/:keyId/dividends/:wallet
+
+Return the wallet's dividend amounts for every snapshot of the key. Each
+snapshot includes `claimableAmount`, `claimedAmount`, and the claim window.
+`claimableAmount` is the wallet's unclaimed amount; the claim-window fields
+indicate when the on-chain claim is available.
+
+- **Auth:** None
+- **Response:** `200 OK`; invalid wallet addresses return `400`, and unknown
+  keys return `404`.

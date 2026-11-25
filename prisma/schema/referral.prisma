@@ -44,6 +44,8 @@ model Referral {
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 
+  hold            ReferralHold?
+
   @@index([referrerAddress, createdAt])
   @@index([referrerAddress])
 }
@@ -73,6 +75,9 @@ model ReferralEvent {
   // Fee amount in XLM
   amount        Decimal
 
+  // Tier multiplier applied at the time of this reward (1.0, 1.5, or 2.0)
+  tierMultiplier Float    @default(1.0)
+
   // Transaction correlation
   txHash        String?
   eventIndex    Int?
@@ -82,4 +87,180 @@ model ReferralEvent {
   @@index([walletAddress, createdAt])
   @@index([keyId])
   @@index([refereeAddress])
+}
+
+/**
+ * Current referral tier state for a wallet, derived from on-chain
+ * `ReferralTierUpgraded` events (#1034).
+ *
+ * One row per referrer. `tier` is the highest tier reached, `cumulativeVolume`
+ * the total referred volume that earned it, and `lastUpgradedAt` the timestamp
+ * of the most recent upgrade.
+ */
+model ReferralTier {
+  id               String    @id @default(cuid())
+
+  // Referrer wallet whose tier is tracked
+  walletAddress    String    @unique
+
+  // Highest referral tier reached (1, 2 or 3)
+  tier             Int       @default(1)
+
+  // Cumulative referred volume in XLM
+  cumulativeVolume Decimal   @default(0) @db.Decimal(20, 7)
+
+  // When the wallet last upgraded tiers
+  lastUpgradedAt   DateTime?
+
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  @@index([tier])
+  @@map("referral_tiers")
+}
+
+/**
+ * Append-only history of referral tier upgrades (#1034).
+ *
+ * One row per `ReferralTierUpgraded` event. The `(txHash, eventIndex)` pair is
+ * unique so replaying the same chain event is idempotent and never records a
+ * duplicate upgrade.
+ */
+model ReferralTierEvent {
+  id               String   @id @default(cuid())
+
+  // Referrer wallet that upgraded
+  walletAddress    String
+
+  previousTier     Int
+  newTier          Int
+
+  // Cumulative referred volume in XLM at the time of the upgrade
+  cumulativeVolume Decimal  @db.Decimal(20, 7)
+
+  // Chain correlation
+  ledger           Int
+  txHash           String
+  eventIndex       Int
+
+  // On-chain event timestamp
+  occurredAt       DateTime
+
+  createdAt        DateTime @default(now())
+
+  @@unique([txHash, eventIndex])
+  @@index([walletAddress, occurredAt(sort: Desc)])
+  @@map("referral_tier_events")
+}
+
+// Referral reward earnings indexed from the on-chain
+// `ReferralRewardDistributed` event (#1057).
+//
+// One row per distributed reward. `referrerWallet` is the wallet that earned
+// the reward; `sourceWallet` is the referred wallet whose activity generated
+// it; `tier` is the referral tier (1 = direct, 2 = second level, 3 = third
+// level). The `(txHash, eventIndex)` pair is unique so replaying the same
+// chain event is idempotent and never double-counts earnings.
+model ReferralEarning {
+  id             String   @id @default(cuid())
+
+  // Wallet that earned the reward
+  referrerWallet String
+
+  // Referred wallet whose activity generated the reward
+  sourceWallet   String
+
+  // Referral tier (1, 2 or 3)
+  tier           Int
+
+  // Reward amount in XLM
+  amount         Decimal  @db.Decimal(20, 7)
+
+  // Chain correlation
+  ledger         Int
+  txHash         String
+  eventIndex     Int
+
+  // Event timestamp on-chain
+  earnedAt       DateTime
+
+  createdAt      DateTime @default(now())
+
+  @@unique([txHash, eventIndex])
+  @@index([referrerWallet, earnedAt(sort: Desc)])
+  @@index([referrerWallet, tier])
+  @@index([sourceWallet])
+  @@map("referral_earnings")
+}
+
+/// Review state of a referral reward that abuse detection withheld (#1241).
+enum ReferralHoldStatus {
+  /// Waiting for an admin to release or reject it; no reward paid yet.
+  PENDING
+  /// An admin approved it; the withheld reward was paid exactly once.
+  RELEASED
+  /// Rejected, either automatically (self-referral, shared funding source,
+  /// linked wallets) or by an admin. No reward is ever paid.
+  REJECTED
+}
+
+/// Abuse-detection verdict for a referral (#1241). At most one per referral.
+/// While PENDING, every reward the referral earns is withheld as a
+/// `ReferralHoldReward` row; releasing the hold pays them all, once. Once
+/// RELEASED later trades pay normally, and once REJECTED they never pay.
+model ReferralHold {
+  id              String             @id @default(cuid())
+  referralId      String             @unique
+  referral        Referral           @relation(fields: [referralId], references: [id], onDelete: Cascade)
+
+  /// Machine-readable rule that fired (SELF_REFERRAL, SHARED_FUNDING_SOURCE,
+  /// LINKED_WALLETS, FUNDING_CLUSTER).
+  reason          String
+  status          ReferralHoldStatus @default(PENDING)
+  /// Evidence for reviewers (funder address, cluster size, window).
+  details         Json?
+
+  referrerAddress String
+  refereeAddress  String
+
+  resolvedBy      String?
+  resolvedAt      DateTime?
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  rewards         ReferralHoldReward[]
+
+  @@index([status, createdAt])
+}
+
+/// One reward withheld by a PENDING `ReferralHold` (#1241): everything needed
+/// to write the `ReferralEvent` fee row if an admin releases the hold.
+model ReferralHoldReward {
+  id             String       @id @default(cuid())
+  holdId         String
+  hold           ReferralHold @relation(fields: [holdId], references: [id], onDelete: Cascade)
+
+  keyId          String
+  rewardXlm      Decimal      @db.Decimal(20, 7)
+  /// Tier multiplier in effect when the reward was earned.
+  tierMultiplier Float        @default(1.0)
+  txHash         String?
+  eventIndex     Int?
+  tradedAt       DateTime
+  createdAt      DateTime     @default(now())
+
+  @@index([holdId])
+}
+
+/// Cached account funding source: the account that issued the
+/// `create_account` operation which first funded a wallet (#1241). Only
+/// resolved lookups are stored. Used by referral abuse detection.
+model WalletFundingSource {
+  id        String   @id @default(cuid())
+  address   String   @unique
+  funder    String
+  fundedAt  DateTime
+  fetchedAt DateTime @default(now())
+
+  @@index([funder, fundedAt])
 }

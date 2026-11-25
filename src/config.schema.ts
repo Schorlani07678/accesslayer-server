@@ -64,6 +64,11 @@ export const envSchema = z
          .string()
          .url('FRONTEND_URL must be a valid URL')
          .min(1, 'FRONTEND_URL is required'),
+      // Public origin of the website, used for absolute sitemap and robots.txt URLs
+      PUBLIC_SITE_URL: z
+         .string()
+         .url('PUBLIC_SITE_URL must be a valid URL')
+         .min(1, 'PUBLIC_SITE_URL is required'),
 
       // Cloudinary
       CLOUDINARY_CLOUD_NAME: z
@@ -80,6 +85,9 @@ export const envSchema = z
          .string()
          .min(1, 'PAYSTACK_SECRET_KEY is required for payment processing'),
       PAYSTACK_PUBLIC_KEY: optionalNonEmptyString,
+      VAPID_PUBLIC_KEY: optionalNonEmptyString,
+      VAPID_PRIVATE_KEY: optionalNonEmptyString,
+      VAPID_SUBJECT: optionalNonEmptyString,
       ENABLE_RESPONSE_TIMING: booleanCoerce.default(true),
       API_VERSION: z.string().default('1.0.0'),
       ENABLE_API_VERSION_HEADER: booleanCoerce.default(true),
@@ -90,6 +98,10 @@ export const envSchema = z
       DB_POOL_WAIT_ERROR_MS: z.coerce.number().int().positive().default(5000),
       WEBHOOK_MAX_PER_CREATOR: z.coerce.number().int().positive().default(5),
       WEBHOOK_RETRY_MAX_ATTEMPTS: z.coerce.number().int().positive().default(3),
+      // Token rescues above this amount (base units) send one alert. Unset disables alerts (#1271).
+      TOKEN_RESCUE_ALERT_THRESHOLD: optionalNonEmptyString,
+      // Ledgers after a protocol pause before escape redemptions open (#1265).
+      PROTOCOL_ESCAPE_DELAY_LEDGERS: z.coerce.number().int().nonnegative().default(17280),
 
       APP_SECRET: z
          .string()
@@ -116,6 +128,15 @@ export const envSchema = z
       // Key trade lockup
       LOCKUP_DURATION_SECONDS: z.coerce.number().int().nonnegative().default(0),
 
+      // Staking lock period options (#881): comma-separated `name=seconds`
+      // pairs. Clients pick one by name when staking; the lock expires
+      // `seconds` after the stake is created.
+      STAKING_LOCK_PERIOD_OPTIONS: z
+         .string()
+         .default(
+            'flexible=0,30d=2592000,90d=7776000,180d=15552000,365d=31536000'
+         ),
+
       // Protocol revenue distribution (#883): length of each distribution
       // cycle in days. Trading fees are aggregated into a pool per cycle and
       // claimed proportionally to stake weight (see src/modules/revenue).
@@ -129,6 +150,12 @@ export const envSchema = z
       // paid to the referrer, in basis points (500 = 5%). Paid once per
       // referee, on their first trade only (see src/modules/referrals).
       REFERRAL_REWARD_BPS: z.coerce.number().int().nonnegative().default(500),
+
+      // Referral abuse detection (#1241): comma-separated Stellar addresses
+      // of known high-volume funders (exchange or anchor hot wallets). Wallets
+      // funded by these accounts are not treated as sharing a funding source
+      // or forming a sybil cluster, since many unrelated users share them.
+      REFERRAL_ABUSE_FUNDER_ALLOWLIST: optionalNonEmptyString,
 
       // 2-of-3 admin multisig set for key deprecation (#882). Comma-separated
       // Stellar addresses of the admin quorum. When unset, deprecation still
@@ -198,6 +225,23 @@ export const envSchema = z
             'STELLAR_SOROBAN_RPC_URL must be a valid URL (e.g. https://soroban-testnet.stellar.org)'
          )
          .default('https://soroban-testnet.stellar.org'),
+      // Comma-separated Soroban RPC endpoints for health-based failover (#1336).
+      // Falls back to STELLAR_SOROBAN_RPC_URL when unset.
+      SOROBAN_RPC_URLS: optionalNonEmptyString,
+      RPC_POOL_PROBE_INTERVAL_MS: z.coerce.number().int().positive().default(15000),
+      RPC_POOL_COOLDOWN_MS: z.coerce.number().int().positive().default(60000),
+      RPC_POOL_MAX_LEDGER_LAG: z.coerce.number().int().nonnegative().default(5),
+      RPC_POOL_ERROR_RATE_THRESHOLD: z.coerce.number().min(0).max(1).default(0.5),
+      RPC_POOL_MIN_SAMPLES_FOR_ERROR_RATE: z.coerce.number().int().positive().default(5),
+      RPC_POOL_HEDGE_DELAY_MS: z.coerce.number().int().positive().default(750),
+
+      // Limit-order keeper: required profit over simulated network fee.
+      ORDER_KEEPER_PROFIT_MARGIN_BPS: z.coerce
+         .number()
+         .int()
+         .nonnegative()
+         .safe()
+         .default(1000),
 
       // Soroban contract interaction service (#899): submission retries with
       // exponential backoff, confirmation polling, and resolution events.
@@ -237,6 +281,75 @@ export const envSchema = z
          .positive()
          .default(300),
 
+      // Key price velocity circuit breaker (#1195): after each indexed trade
+      // the key is paused when its price moved more than this percentage, in
+      // either direction, against the price WINDOW_SIZE trades earlier.
+      KEY_PRICE_VELOCITY_THRESHOLD_PCT: z.coerce
+         .number()
+         .positive()
+         .default(50),
+      KEY_PRICE_VELOCITY_WINDOW_SIZE: z.coerce
+         .number()
+         .int()
+         .min(1)
+         .max(500)
+         .default(10),
+
+      // Key content gate config cache (#1150)
+      GATE_CONFIG_CACHE_TTL_SECONDS: z.coerce
+         .number()
+         .int()
+         .positive()
+         .default(60),
+
+      // Dynamic fee contract (#1055)
+      DYNAMIC_FEE_CONTRACT_ID: optionalNonEmptyString,
+
+      // Nonce registry contract (#1039): deployed contract id holding the
+      // on-chain single-use nonce registry, and short TTL for cached nonces.
+      NONCE_REGISTRY_CONTRACT_ID: optionalNonEmptyString,
+      NONCE_CACHE_TTL_SECONDS: z.coerce.number().int().positive().default(30),
+
+      // LP position registry contract
+      LP_CONTRACT_ID: optionalNonEmptyString,
+
+      // Key LP reward accrual (#1196): share of each key's trading volume, in
+      // basis points, that funds its LP reward pool. The hourly accrual job
+      // distributes the pool pro-rata by lp_tokens; it catches up at most
+      // LP_REWARD_ACCRUAL_MAX_CATCHUP_EPOCHS missed epochs per key per run.
+      LP_FEE_BPS: z.coerce.number().int().min(0).max(10_000).default(30),
+      LP_REWARD_ACCRUAL_ENABLED: booleanCoerce.default(true),
+      LP_REWARD_ACCRUAL_MAX_CATCHUP_EPOCHS: z.coerce
+         .number()
+         .int()
+         .positive()
+         .default(24),
+
+      // Staking contract (#1086): deployed staking contract used for live
+      // get_stake_rewards simulation calls. When unset, accrued rewards
+      // degrade gracefully to '0' rather than failing.
+      STAKING_CONTRACT_ID: optionalNonEmptyString,
+
+      // Invoice protocol adapters. Unconfigured reads/execution fail closed.
+      ISSUER_REPUTATION_CONTRACT_ID: optionalNonEmptyString,
+      INVOICE_TRANSFER_CONTRACT_ID: optionalNonEmptyString,
+      INVOICE_MARKET_CONTRACT_ID: optionalNonEmptyString,
+      INVOICE_MARKET_ABI: optionalNonEmptyString,
+      INVOICE_FRAUD_CONTRACT_ID: optionalNonEmptyString,
+      INVOICE_TIMELOCK_CONTRACT_ID: optionalNonEmptyString,
+
+      // Portfolio health score contract (get_health_score). Unset fails the
+      // /investors/:wallet/health-score read closed with 503.
+      PORTFOLIO_HEALTH_CONTRACT_ID: optionalNonEmptyString,
+
+      // Social metadata sync (Pinata gateway used to resolve avatar CIDs)
+      PINATA_GATEWAY_URL: z
+         .string()
+         .url(
+            'PINATA_GATEWAY_URL must be a valid URL (e.g. https://gateway.pinata.cloud/ipfs)'
+         )
+         .default('https://gateway.pinata.cloud/ipfs'),
+
       // Ownership snapshot cleanup job
       OWNERSHIP_SNAPSHOT_TABLE_NAME: z
          .string()
@@ -269,6 +382,50 @@ export const envSchema = z
          .positive()
          .default(60),
 
+      // Session activity logging + anomaly detection (#1035)
+      SESSION_ACTIVITY_LOGGING_ENABLED: booleanCoerce.default(true),
+      SESSION_ACTIVITY_RETENTION_DAYS: z.coerce
+         .number()
+         .int()
+         .positive()
+         .default(30),
+      SESSION_ACTIVITY_CLEANUP_ENABLED: booleanCoerce.default(true),
+      SESSION_ACTIVITY_CLEANUP_INTERVAL_MINUTES: z.coerce
+         .number()
+         .int()
+         .positive()
+         .default(60),
+      // Daily bounded retention worker. Keep dry-run enabled until an
+      // operator explicitly opts into deleting production data.
+      RETENTION_WORKER_ENABLED: booleanCoerce.default(true),
+      RETENTION_DRY_RUN: booleanCoerce.default(true),
+      // Partition maintenance (#1333)
+      PARTITION_MANAGER_ENABLED: booleanCoerce.default(true),
+      PARTITION_RETENTION_MONTHS: z.coerce.number().int().positive().default(12),
+      PARTITION_PRECREATE_MONTHS: z.coerce.number().int().positive().default(3),
+      SESSION_ANOMALY_RATE_WINDOW_MINUTES: z.coerce
+         .number()
+         .int()
+         .positive()
+         .default(5),
+      SESSION_ANOMALY_RATE_THRESHOLD: z.coerce
+         .number()
+         .int()
+         .positive()
+         .default(120),
+      SESSION_ANOMALY_UNUSUAL_HOUR_START: z.coerce
+         .number()
+         .int()
+         .min(0)
+         .max(23)
+         .default(1),
+      SESSION_ANOMALY_UNUSUAL_HOUR_END: z.coerce
+         .number()
+         .int()
+         .min(0)
+         .max(23)
+         .default(5),
+
       // Price movement detection job (feeds price_moved notifications)
       DETECT_PRICE_MOVEMENTS_ENABLED: booleanCoerce.default(true),
       DETECT_PRICE_MOVEMENTS_INTERVAL_MINUTES: z.coerce
@@ -284,6 +441,11 @@ export const envSchema = z
          .int()
          .positive()
          .default(5),
+
+      // Minimum number of observations a TWAPUpdated snapshot must carry for
+      // GET /keys/:key_id/twap to treat it as valid (#1082). Below this the
+      // endpoint responds with TWAPInvalid instead of a price.
+      TWAP_MIN_OBSERVATIONS: z.coerce.number().int().positive().default(3),
 
       // Governance proposal sync job
       GOVERNANCE_SYNC_ENABLED: booleanCoerce.default(false),
@@ -323,11 +485,7 @@ export const envSchema = z
       // unauthenticated) database query budget. See
       // src/middlewares/query-cost-governor.middleware.ts.
       QUERY_COST_BUDGET: z.coerce.number().int().positive().default(200),
-      QUERY_COST_WINDOW_MS: z.coerce
-         .number()
-         .int()
-         .positive()
-         .default(60_000),
+      QUERY_COST_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
       // JSON object overriding/extending the default route->cost map in
       // src/constants/query-cost.constants.ts, e.g.
       // '{"GET /search": 8, "GET /custom-route": 2}'. Merged over the
@@ -336,6 +494,9 @@ export const envSchema = z
       QUERY_COST_MAP_JSON: optionalNonEmptyString,
       // Comma-separated wallet addresses that bypass the governor entirely.
       QUERY_COST_ADMIN_WALLETS: optionalNonEmptyString,
+      // Comma-separated wallet addresses allowed to triage key reports via
+      // the /admin/reports moderator queue (#1226).
+      MODERATOR_WALLETS: optionalNonEmptyString,
       HORIZON_WEBHOOK_SECRET: optionalNonEmptyString,
       WEBHOOK_RETRY_BASE_DELAY_MS: z.coerce
          .number()
@@ -389,11 +550,7 @@ export const envSchema = z
          .int()
          .positive()
          .default(300_000),
-      ORACLE_CACHE_TTL_MS: z.coerce
-         .number()
-         .int()
-         .positive()
-         .default(30_000),
+      ORACLE_CACHE_TTL_MS: z.coerce.number().int().positive().default(30_000),
 
       // Flash loan guard (#938): violations indexed from
       // FlashLoanGuardTriggered contract events. A wallet that reaches
@@ -427,13 +584,186 @@ export const envSchema = z
          .default(60),
 
       // Creator key on-chain metadata sync (#986)
-      PINATA_GATEWAY_URL: z.string().default('https://gateway.pinata.cloud/ipfs'),
       METADATA_STALENESS_THRESHOLD_MS: z.coerce
          .number()
          .int()
          .positive()
          .default(10 * 60 * 1000), // 10 minutes
+
+      // Multi-tier circuit breaker configuration (#726)
+      CIRCUIT_BREAKER_FAILURE_THRESHOLD: z.coerce
+         .number()
+         .int()
+         .positive()
+         .default(5),
+      CIRCUIT_BREAKER_RATE_THRESHOLD: z.coerce
+         .number()
+         .min(1)
+         .max(100)
+         .default(50),
+      CIRCUIT_BREAKER_COOLDOWN_SECONDS: z.coerce
+         .number()
+         .int()
+         .positive()
+         .default(30),
+      CIRCUIT_BREAKER_WINDOW_SECONDS: z.coerce
+         .number()
+         .int()
+         .positive()
+         .default(60),
+
+      // Per-dependency overrides for Soroban RPC
+      CIRCUIT_BREAKER_SOROBAN_RPC_FAILURE_THRESHOLD: z.coerce
+         .number()
+         .int()
+         .positive()
+         .optional(),
+      CIRCUIT_BREAKER_SOROBAN_RPC_RATE_THRESHOLD: z.coerce
+         .number()
+         .min(1)
+         .max(100)
+         .optional(),
+      CIRCUIT_BREAKER_SOROBAN_RPC_COOLDOWN_SECONDS: z.coerce
+         .number()
+         .int()
+         .positive()
+         .optional(),
+      CIRCUIT_BREAKER_SOROBAN_RPC_WINDOW_SECONDS: z.coerce
+         .number()
+         .int()
+         .positive()
+         .optional(),
+
+      // Per-dependency overrides for Horizon
+      CIRCUIT_BREAKER_HORIZON_FAILURE_THRESHOLD: z.coerce
+         .number()
+         .int()
+         .positive()
+         .optional(),
+      CIRCUIT_BREAKER_HORIZON_RATE_THRESHOLD: z.coerce
+         .number()
+         .min(1)
+         .max(100)
+         .optional(),
+      CIRCUIT_BREAKER_HORIZON_COOLDOWN_SECONDS: z.coerce
+         .number()
+         .int()
+         .positive()
+         .optional(),
+      CIRCUIT_BREAKER_HORIZON_WINDOW_SECONDS: z.coerce
+         .number()
+         .int()
+         .positive()
+         .optional(),
+
+      // Per-dependency overrides for Redis
+      CIRCUIT_BREAKER_REDIS_FAILURE_THRESHOLD: z.coerce
+         .number()
+         .int()
+         .positive()
+         .optional(),
+      CIRCUIT_BREAKER_REDIS_RATE_THRESHOLD: z.coerce
+         .number()
+         .min(1)
+         .max(100)
+         .optional(),
+      CIRCUIT_BREAKER_REDIS_COOLDOWN_SECONDS: z.coerce
+         .number()
+         .int()
+         .positive()
+         .optional(),
+      CIRCUIT_BREAKER_REDIS_WINDOW_SECONDS: z.coerce
+         .number()
+         .int()
+         .positive()
+         .optional(),
+
+      // Per-dependency overrides for Database connection pool
+      CIRCUIT_BREAKER_DATABASE_FAILURE_THRESHOLD: z.coerce
+         .number()
+         .int()
+         .positive()
+         .optional(),
+      CIRCUIT_BREAKER_DATABASE_RATE_THRESHOLD: z.coerce
+         .number()
+         .min(1)
+         .max(100)
+         .optional(),
+      CIRCUIT_BREAKER_DATABASE_COOLDOWN_SECONDS: z.coerce
+         .number()
+         .int()
+         .positive()
+         .optional(),
+      CIRCUIT_BREAKER_DATABASE_WINDOW_SECONDS: z.coerce
+         .number()
+         .int()
+         .positive()
+         .optional(),
+
+      // Campaign evaluation and expiry cron (#campaign-cron)
+      CAMPAIGN_CRON_ENABLED: booleanCoerce.default(true),
+      CAMPAIGN_EVALUATION_INTERVAL_HOURS: z.coerce
+         .number()
+         .int()
+         .positive()
+         .default(24),
+      CAMPAIGN_END_CHECK_INTERVAL_MINUTES: z.coerce
+         .number()
+         .int()
+         .positive()
+         .default(60),
+      CAMPAIGN_QUALIFICATION_BATCH_SIZE: z.coerce
+         .number()
+         .int()
+         .positive()
+         .default(100),
+      CAMPAIGN_QUALIFICATION_CONCURRENCY: z.coerce
+         .number()
+         .int()
+         .positive()
+         .default(5),
+
+      // Key NFT badge minting trigger service (#1148). Minting is disabled
+      // until both the contract id and the server minter secret are set.
+      BADGE_CONTRACT_ID: optionalNonEmptyString,
+      BADGE_MINTER_SECRET: optionalNonEmptyString,
+      // Single-swap size (XLM) that earns the WHALE_HOLDER badge.
+      BADGE_WHALE_THRESHOLD_XLM: z.coerce.number().positive().default(10000),
+      // Continuous hold (days) that earns the DIAMOND_HANDS badge.
+      BADGE_HOLD_MILESTONE_DAYS: z.coerce
+         .number()
+         .int()
+         .positive()
+         .default(365),
+      // Highest leaderboard rank (inclusive) that earns the TOP_TRADER badge.
+      BADGE_TOP_TRADER_MAX_RANK: z.coerce.number().int().positive().default(10),
+      // Max mint attempts before a transient failure is treated as terminal.
+      BADGE_MINT_MAX_ATTEMPTS: z.coerce.number().int().positive().default(3),
+
+      // Lending vault health monitor and liquidation keeper. Liquidations stay
+      // disabled until the contract id and keeper secret are both set.
+      VAULT_HEALTH_MONITOR_ENABLED: booleanCoerce.default(true),
+      VAULT_LIQUIDATION_KEEPER_ENABLED: booleanCoerce.default(true),
+      VAULT_LENDING_CONTRACT_ID: optionalNonEmptyString,
+      LIQUIDATION_KEEPER_SECRET: optionalNonEmptyString,
+      // Slow request threshold (#754): warn-level log for requests exceeding this duration
+      SLOW_REQUEST_THRESHOLD_MS: z.coerce
+         .number()
+         .int()
+         .positive()
+         .default(2000),
+
+      // PII scrubbing (src/lib/scrub.ts). Extra comma-separated field names
+      // are redacted from logs and error reports in addition to the defaults.
+      SCRUB_EXTRA_FIELDS: z.string().default(''),
+      // Keys the wallet-address salt. Unset means a random per-process key,
+      // so hashed wallets only correlate within one process lifetime.
+      SCRUB_WALLET_HASH_SECRET: optionalNonEmptyString,
+      // How often the wallet-address salt rotates.
+      SCRUB_WALLET_SALT_ROTATION_DAYS: z.coerce.number().positive().default(7),
    })
+   .passthrough()
+   .catchall(z.any())
    .superRefine((data, ctx) => {
       if (data.MODE === 'production' && data.STELLAR_NETWORK === 'testnet') {
          ctx.addIssue({

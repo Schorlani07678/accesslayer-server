@@ -63,12 +63,10 @@ export async function processTradeEvent(
       return false;
    }
 
-   const existing = await db.trade.findUnique({
+   const existing = await db.trade.findFirst({
       where: {
-         ledger_txHash: {
-            ledger: event.ledger,
-            txHash: event.tx_hash,
-         },
+         ledger: event.ledger,
+         txHash: event.tx_hash,
       },
       select: { id: true },
    });
@@ -87,11 +85,30 @@ export async function processTradeEvent(
          txHash: event.tx_hash,
          timestamp: new Date(event.timestamp),
          paymentAsset:
-            typeof event.payment_asset === 'string' && event.payment_asset.trim() !== ''
+            typeof event.payment_asset === 'string' &&
+            event.payment_asset.trim() !== ''
                ? event.payment_asset.trim().toUpperCase()
                : 'XLM',
       },
    });
+
+   // Price velocity circuit breaker (#1195): pause the key straight after a
+   // trade that moves its price past the threshold. A failure here is logged
+   // loudly but does not fail indexing of the trade itself.
+   try {
+      const { checkPriceVelocityAfterTrade } =
+         await import('../keys/price-velocity-breaker.service');
+      await checkPriceVelocityAfterTrade(db, {
+         creatorId: event.creator_id,
+         txHash: event.tx_hash,
+         ledger: event.ledger,
+      });
+   } catch (error) {
+      logger.error(
+         { error, creatorId: event.creator_id, tx_hash: event.tx_hash },
+         'Price velocity circuit breaker check failed'
+      );
+   }
 
    try {
       const { accrueLpRewards } = await import('./lp-indexer.service');
@@ -104,7 +121,8 @@ export async function processTradeEvent(
       const { invalidateCreatorDashboardCache } =
          await import('../creator/creator-dashboard.service');
       await invalidateCreatorDashboardCache(event.creator_id);
-      const { invalidateKeyTwapCache } = await import('../keys/key-twap-window.service');
+      const { invalidateKeyTwapCache } =
+         await import('../keys/key-twap-window.service');
       await invalidateKeyTwapCache(event.creator_id);
    } catch {
       // Non-critical cache invalidation failure
@@ -126,5 +144,22 @@ export async function processTradeEvent(
       // Non-critical cache invalidation failure
    }
 
+   try {
+      const { invalidateDiscoveryCache } =
+         await import('../keys/discovery.service');
+      invalidateDiscoveryCache();
+   } catch {
+      // Non-critical cache invalidation failure
+   }
+
    return true;
 }
+
+export {
+   processBundleTradeEvent,
+   processBundleTradeEvents,
+   BundleExecutedEvent,
+   BundleItem,
+   NormalizedBundleItem,
+   IndexedBundleTrade,
+} from './bundle-trade-indexer.service';

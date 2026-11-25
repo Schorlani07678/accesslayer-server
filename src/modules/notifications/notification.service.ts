@@ -301,6 +301,83 @@ async function buildPriceMoved(
    return notifications;
 }
 
+async function buildPriceAlertTriggered(
+   walletAddress: string,
+   lastReadAt: Date | null
+): Promise<NotificationItem[]> {
+   const alerts = await prisma.priceAlert.findMany({
+      where: { walletAddress, triggeredAt: { not: null } },
+      orderBy: { triggeredAt: 'desc' },
+      take: 50,
+      select: {
+         id: true,
+         creatorId: true,
+         direction: true,
+         targetPrice: true,
+         triggeredPrice: true,
+         triggeredAt: true,
+      },
+   });
+
+   return alerts.flatMap(alert => {
+      if (!alert.triggeredAt) return [];
+      return [{
+         id: `price_alert_triggered:${alert.id}`,
+         type: NOTIFICATION_TYPES.PRICE_ALERT_TRIGGERED,
+         createdAt: alert.triggeredAt.toISOString(),
+         read: isRead(alert.triggeredAt, lastReadAt),
+         payload: {
+            alertId: alert.id,
+            keyId: alert.creatorId,
+            direction: alert.direction,
+            targetPrice: alert.targetPrice.toString(),
+            triggeredPrice: alert.triggeredPrice?.toString() ?? null,
+         },
+      }];
+   });
+}
+
+/**
+ * Warnings for lending-vault positions whose health dropped below the warning
+ * threshold. The health monitor stamps `warningAt` on the first pass below the
+ * threshold and clears it on recovery, so each drop yields exactly one item.
+ */
+async function buildVaultHealthWarning(
+   walletAddress: string,
+   lastReadAt: Date | null
+): Promise<NotificationItem[]> {
+   const warnings = await prisma.vaultHealth.findMany({
+      where: { wallet: walletAddress, warningAt: { not: null } },
+      orderBy: { warningAt: 'desc' },
+      take: 50,
+   });
+
+   return warnings.map(
+      (row: {
+         positionId: string;
+         healthFactor: { toString(): string };
+         liquidationPriceXlm: { toString(): string } | null;
+         warningAt: Date | null;
+      }) => {
+         const createdAt = row.warningAt!;
+         return {
+            id: `vault_health_warning:${row.positionId}`,
+            type: NOTIFICATION_TYPES.VAULT_HEALTH_WARNING,
+            createdAt: createdAt.toISOString(),
+            read: isRead(createdAt, lastReadAt),
+            payload: {
+               positionId: row.positionId,
+               healthFactor: row.healthFactor.toString(),
+               liquidationPriceXlm:
+                  row.liquidationPriceXlm !== null
+                     ? row.liquidationPriceXlm.toString()
+                     : null,
+            },
+         };
+      }
+   );
+}
+
 export async function listNotifications(
    walletAddress: string,
    now: Date = new Date()
@@ -311,22 +388,28 @@ export async function listNotifications(
       trades,
       lockups,
       priceMoved,
+      priceAlertTriggered,
       keyDeprecated,
       circuitBreakerTrips,
+      vaultHealthWarnings,
    ] = await Promise.all([
       buildTradeCompleted(walletAddress, lastReadAt),
       buildLockupExpiring(walletAddress, lastReadAt, now),
       buildPriceMoved(walletAddress, lastReadAt, now),
+      buildPriceAlertTriggered(walletAddress, lastReadAt),
       buildKeyDeprecated(walletAddress, lastReadAt),
       buildCircuitBreakerTripped(walletAddress, lastReadAt),
+      buildVaultHealthWarning(walletAddress, lastReadAt),
    ]);
 
    return [
       ...trades,
       ...lockups,
       ...priceMoved,
+      ...priceAlertTriggered,
       ...keyDeprecated,
       ...circuitBreakerTrips,
+      ...vaultHealthWarnings,
    ].sort(
       (a, b) =>
          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()

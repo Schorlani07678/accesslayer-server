@@ -3,6 +3,7 @@
 //   POST /referrals/register
 //   GET  /referrals/earnings
 //   GET  /referrals/referred
+//   GET  /wallets/:address/referrals
 
 import { z } from 'zod';
 import { safeIntParam } from '../../utils/query.utils';
@@ -41,6 +42,27 @@ export const ReferredWalletsQuerySchema = z
    .strict();
 
 export type ReferredWalletsQuery = z.infer<typeof ReferredWalletsQuerySchema>;
+
+/** Query shared by the wallet-specific stats and event history endpoints. */
+export const ReferralWalletQuerySchema = z
+   .object({
+      wallet: z.string().trim().min(1).optional(),
+      limit: safeIntParam({
+         defaultValue: DEFAULT_REFERRED_PAGE_SIZE,
+         min: MIN_PAGE_SIZE,
+         max: MAX_PAGE_SIZE,
+         label: 'Limit',
+      }),
+      cursor: z.string().optional(),
+   })
+   .strict();
+export type ReferralWalletQuery = z.infer<typeof ReferralWalletQuerySchema>;
+
+/** Key whose per-contract accrued reward balance should be claimed. */
+export const ReferralClaimSchema = z
+   .object({ keyId: z.string().trim().min(1).max(128) })
+   .strict();
+export type ReferralClaimInput = z.infer<typeof ReferralClaimSchema>;
 
 /** Opaque cursor payload for the referred wallets list. */
 export interface ReferredCursorPayload {
@@ -87,3 +109,16 @@ export const ReferralEarningsBreakdownItemSchema = z.object({
 export type ReferralEarningsBreakdownItem = z.infer<
    typeof ReferralEarningsBreakdownItemSchema
 >;
+
+/** GET /wallets/:address/referrals response. */
+export const ReferralStatsSchema = z.object({
+   /** Total number of wallets that registered with this wallet's referral code. */
+   referralCount: z.number(),
+   /** Current tier based on referral count. */
+   tier: z.enum(['BRONZE', 'SILVER', 'GOLD']),
+   /** Total XLM earned from referral rewards (all time). */
+   totalEarned: z.number(),
+   /** XLM earned but not yet claimed (pending). */
+   pendingClaim: z.number(),
+});
+export type ReferralStats = z.infer<typeof ReferralStatsSchema>;
